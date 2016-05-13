@@ -42,7 +42,7 @@ type (
 		hpackEncoderBuffer bytes.Buffer
 		flowControlWindow  int64 // это лимит удаленной стороны, который мы уменьшаем, когда МЫ отсылаем DATA фреймы, а не когда их присылают нам
 
-		streamsActive   map[uint32]*Stream
+		streamsActive   map[uint32]*connectionStream
 		streamsActiveMu sync.RWMutex
 
 		limitedReader io.LimitedReader
@@ -69,7 +69,7 @@ func NewConnection(host string, port int) (*Connection, error) {
 		lastStreamId:      1, // нечетные для клиента, 1 стрим пропускается.
 		settings:          settings,
 		flowControlWindow: int64(settings.InitialWindowSize),
-		streamsActive:     make(map[uint32]*Stream),
+		streamsActive:     make(map[uint32]*connectionStream),
 	}
 
 	h2c.pollBytesBuffer.New = func() interface{} {
@@ -227,16 +227,16 @@ func (c *Connection) reader() {
 				switch header.Key {
 				case `:status`:
 					if code, err := strconv.Atoi(header.Value); err == nil {
-						stream.responseStatus = code
+						stream.resp.Status = code
 					}
 
 				case `content-length`:
 					if size, err := strconv.Atoi(header.Value); err == nil {
-						stream.contentLength = int64(size)
+						stream.resp.Body.Grow(size) // ?
 					}
 
 				default:
-					stream.headers = append(stream.headers, header)
+					stream.resp.Headers = append(stream.resp.Headers, header)
 				}
 			}
 			c.pollHeaderFrames.Put(headersFrame)
@@ -246,7 +246,7 @@ func (c *Connection) reader() {
 
 			c.limitedReader.R = dataFrame.Data
 			c.limitedReader.N = int64(dataFrame.Data.Len())
-			stream.responseBody.ReadFrom(&c.limitedReader)
+			stream.resp.Body.ReadFrom(&c.limitedReader)
 
 			c.pollDataFrames.Put(dataFrame)
 
@@ -264,26 +264,24 @@ func (c *Connection) reader() {
 	}
 }
 
-func (c *Connection) Req(method string, path string, headers [][2]string) (respStatus int, respBody bytes.Buffer, respHeaders []HeaderPair, err error) {
+func (c *Connection) Req(method string, path string, headers []HeaderPair) (*response, error) {
 	if c.connState == ConnectionStateClosed {
-		err = errors.Wrap(ErrConnectionAlreadyClosed, `Cannot work over closed connection`)
-		return
+		return nil, errors.Wrap(ErrConnectionAlreadyClosed, `Cannot work over closed connection`)
 	}
 
-	for c.connState != ConnectionStateOpened {
-		time.Sleep(100 * time.Millisecond)
+	for c.connState != ConnectionStateOpened { // ToDo: сделать лучше
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	c.doMu.Lock()
 	payload, err := c.buildRequestPayload(method, path, headers)
 	if err != nil {
 		c.doMu.Unlock()
-		err = errors.Wrap(err, `buildRequestPayload fail`)
-		return
+		return nil, errors.Wrap(err, `buildRequestPayload fail`)
 	}
 
 	streamIdx := atomic.AddUint32(&c.lastStreamId, 2)
-	stream := c.pollStream.Get().(*Stream)
+	stream := c.pollStream.Get().(*connectionStream)
 	stream.Reset(c)
 
 	c.streamsActiveMu.Lock()
@@ -295,19 +293,17 @@ func (c *Connection) Req(method string, path string, headers [][2]string) (respS
 	if err != nil {
 		c.doMu.Unlock()
 		c.pollStream.Put(stream)
-		err = errors.Wrap(err, `Send frame fail`)
-		return
+		return nil, errors.Wrap(err, `Send frame fail`)
 	}
 	c.doMu.Unlock()
 
 	// recv response
 	<-stream.respWait
 
-	c.pollStream.Put(stream)
-	return stream.responseStatus, stream.responseBody, stream.headers, nil
+	return &stream.resp, nil
 }
 
-func (c *Connection) buildRequestPayload(method string, path string, headers [][2]string) (*bytes.Buffer, error) {
+func (c *Connection) buildRequestPayload(method string, path string, headers []HeaderPair) (*bytes.Buffer, error) {
 	c.hpackEncoderBuffer.Reset()
 
 	if err := c.hpackEncoder.WriteField(hpack.HeaderField{Name: `:method`, Value: strings.ToUpper(method)}); err != nil {
@@ -320,8 +316,8 @@ func (c *Connection) buildRequestPayload(method string, path string, headers [][
 		return nil, errors.Wrap(err, `HPACK encoder fail`)
 	}
 	for _, header := range headers {
-		key := strings.ToLower(header[0])
-		val := header[1]
+		key := strings.ToLower(header.Key)
+		val := header.Value
 		if err := c.hpackEncoder.WriteField(hpack.HeaderField{Name: key, Value: val}); err != nil {
 			return nil, errors.Wrap(err, `HPACK encoder fail`)
 		}
