@@ -40,7 +40,9 @@ type (
 		hpackDecoder       *hpack.Decoder
 		hpackEncoder       *hpack.Encoder
 		hpackEncoderBuffer bytes.Buffer
-		flowControlWindow  int64 // это лимит удаленной стороны, который мы уменьшаем, когда МЫ отсылаем DATA фреймы, а не когда их присылают нам
+
+		flowControlWindow int64 // это лимит удаленной стороны, который мы уменьшаем, когда МЫ отсылаем DATA фреймы, а не когда их присылают нам
+		// ToDo: операции с flowControlWindow должны идти через atomic или иным способом быть атомарными
 
 		streamsActive   map[uint32]*connectionStream
 		streamsActiveMu sync.RWMutex
@@ -192,11 +194,8 @@ func (c *Connection) reader() {
 
 			case FrameTypeWindowUpdate:
 				windowUpdateFrame := frame.(*WindowUpdateFrame)
-				if windowUpdateFrame.StreamId == 0 {
-					c.flowControlWindow += int64(windowUpdateFrame.WindowSizeIncrement)
-				} else {
-					// ToDo: обработка конкретного стрима
-				}
+				// windowUpdateFrame.StreamId == 0
+				c.flowControlWindow += int64(windowUpdateFrame.WindowSizeIncrement)
 
 			case FrameTypeGoaway:
 				goawayFrame := frame.(*GoawayFrame)
@@ -214,7 +213,9 @@ func (c *Connection) reader() {
 		stream, ok := c.streamsActive[frameHdr.StreamId]
 		c.streamsActiveMu.RUnlock()
 		if !ok {
-			fmt.Printf("unexpected frame recv: %v\n", frame)
+			// Сюда попадаем (по хорошему) для уже отработанных стримов, по которым еще долетают фреймы.
+			// Просто игнорируем такие фреймы.
+			//fmt.Printf("unexpected frame recv: %v\n", frame)
 			continue
 		}
 
@@ -250,6 +251,17 @@ func (c *Connection) reader() {
 
 			c.pollDataFrames.Put(dataFrame)
 
+		case FrameTypeRstStream:
+			rstStreamFrame := frame.(*RstStreamFrame)
+			fmt.Printf("RST_STREAM %v\n", rstStreamFrame)
+			// ToDo: нужна нормальная обработка
+
+		case FrameTypeWindowUpdate:
+			// ToDo: обработка конкретного фрейма
+			//windowUpdateFrame := frame.(*WindowUpdateFrame)
+			// windowUpdateFrame.StreamId != 0
+			//c.flowControlWindow += int64(windowUpdateFrame.WindowSizeIncrement)
+
 		default:
 			panic(`WTF for stream frame type ` + frameHdr.Type.String())
 		}
@@ -264,7 +276,7 @@ func (c *Connection) reader() {
 	}
 }
 
-func (c *Connection) Req(method string, path string, headers []HeaderPair) (*response, error) {
+func (c *Connection) Req(method string, path string, headers []HeaderPair, body *bytes.Buffer) (*response, error) {
 	if c.connState == ConnectionStateClosed {
 		return nil, errors.Wrap(ErrConnectionAlreadyClosed, `Cannot work over closed connection`)
 	}
@@ -289,13 +301,60 @@ func (c *Connection) Req(method string, path string, headers []HeaderPair) (*res
 	c.streamsActiveMu.Unlock()
 
 	// send request
-	err = c.sendFrame(FrameTypeHeaders, FlagEndStream|FlagEndHeaders, streamIdx, payload.Bytes())
+
+	flags := FlagEndHeaders
+	if body == nil {
+		flags |= FlagEndStream
+	}
+
+	err = c.sendFrame(FrameTypeHeaders, flags, streamIdx, payload.Bytes())
 	if err != nil {
 		c.doMu.Unlock()
 		c.pollStream.Put(stream)
-		return nil, errors.Wrap(err, `Send frame fail`)
+		return nil, errors.Wrap(err, `Send header frame fail`)
 	}
 	c.doMu.Unlock()
+
+	if body != nil {
+		bufSize := int64(c.settings.MaxFrameSize)
+		if bufSize > c.flowControlWindow {
+			bufSize = c.flowControlWindow
+		}
+		if bl := int64(body.Len()); bufSize > bl {
+			bufSize = bl
+		}
+
+		buf := c.pollByteSlice.Get().([]byte)[:]
+		if int64(cap(buf)) < bufSize {
+			buf = make([]byte, bufSize)
+		}
+
+		bodyPos, bodyRest, bodyBuf := int64(0), int64(body.Len()), body.Bytes()
+		for bodyRest > 0 {
+			wantSend := int64(c.settings.MaxFrameSize)
+			if wantSend > bodyRest {
+				wantSend = bodyRest
+			}
+
+			for wantSend > c.flowControlWindow {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+
+			flags := FrameFlags(0)
+			if wantSend == bodyRest {
+				flags |= FlagEndStream
+			}
+			err := c.sendFrame(FrameTypeData, flags, streamIdx, bodyBuf[bodyPos:bodyPos+wantSend])
+			if err != nil {
+				c.pollByteSlice.Put(buf)
+				return nil, errors.Wrap(err, `Send data frame fail`)
+			}
+			c.flowControlWindow -= wantSend
+			bodyRest -= wantSend
+		}
+		c.pollByteSlice.Put(buf)
+	}
 
 	// recv response
 	<-stream.respWait
@@ -439,7 +498,7 @@ func (c *Connection) recvFrame() (frame Frame, err error) {
 
 	case FrameTypeHeaders:
 		if frameHdr.Flags&(FlagPadded|FlagPriority) != 0 {
-			panic(`NIH`)
+			panic(`NIH padded or priority headers frame`)
 		}
 
 		frameHeaders := c.pollHeaderFrames.Get().(*HeadersFrame)
@@ -462,7 +521,7 @@ func (c *Connection) recvFrame() (frame Frame, err error) {
 
 	case FrameTypeData:
 		if frameHdr.Flags&FlagPadded != 0 {
-			panic(`NIH`)
+			panic(`NIH padded data frame`)
 		}
 
 		frameData := c.pollDataFrames.Get().(*DataFrame)
@@ -472,7 +531,7 @@ func (c *Connection) recvFrame() (frame Frame, err error) {
 			frameData.Data.Reset()
 			frameData.Data.Write(payload[0:frameHdr.Length])
 
-			if err := c.updateFlowWindows(frameHdr.Length, frameHdr.StreamId); err != nil { // ToDo: делать асинхронно
+			if err := c.updateFlowWindows(frameHdr.Length, frameHdr.StreamId); err != nil { // ToDo: делать асинхронно, да и вообще аккумулируя апдейты
 				c.pollDataFrames.Put(frameData)
 				return frame, errors.Wrap(err, `Update flow control window sizes fail`)
 			}
