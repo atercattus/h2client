@@ -57,6 +57,10 @@ var (
 )
 
 func NewConnection(host string, port int) (*Connection, error) {
+	// ToDo: а такой вариант будет работать с подключением по ip?
+	// var c net.Conn = ...
+	// conn, err := tls.Client(c, &tls.Config{)
+
 	conn, err := tls.Dial(`tcp`, host+`:`+strconv.Itoa(port), &tls.Config{NextProtos: []string{`h2`}})
 	if err != nil {
 		return nil, errors.Wrap(err, `TLS connect fail`)
@@ -68,7 +72,7 @@ func NewConnection(host string, port int) (*Connection, error) {
 		port:              port,
 		conn:              conn,
 		connState:         ConnectionStateDisconn,
-		lastStreamId:      1, // нечетные для клиента, 1 стрим пропускается.
+		lastStreamId:      1, // нечетные для клиента, 1 стрим пропускается
 		settings:          settings,
 		flowControlWindow: int64(settings.InitialWindowSize),
 		streamsActive:     make(map[uint32]*connectionStream),
@@ -276,7 +280,11 @@ func (c *Connection) reader() {
 	}
 }
 
-func (c *Connection) Req(method string, path string, headers []HeaderPair, body *bytes.Buffer) (*response, error) {
+func (c *Connection) Req(req *request) (*response, error) {
+	if err := req.prepare(); err != nil {
+		return nil, errors.Wrap(err, `Wrong request`)
+	}
+
 	if c.connState == ConnectionStateClosed {
 		return nil, errors.Wrap(ErrConnectionAlreadyClosed, `Cannot work over closed connection`)
 	}
@@ -286,7 +294,7 @@ func (c *Connection) Req(method string, path string, headers []HeaderPair, body 
 	}
 
 	c.doMu.Lock()
-	payload, err := c.buildRequestPayload(method, path, headers)
+	payload, err := c.buildRequestPayload(req.Method, req.Path, req.Headers)
 	if err != nil {
 		c.doMu.Unlock()
 		return nil, errors.Wrap(err, `buildRequestPayload fail`)
@@ -302,8 +310,10 @@ func (c *Connection) Req(method string, path string, headers []HeaderPair, body 
 
 	// send request
 
+	withBody := (req.Body != nil) && (req.Body.Len() > 0)
+
 	flags := FlagEndHeaders
-	if body == nil {
+	if withBody {
 		flags |= FlagEndStream
 	}
 
@@ -315,12 +325,12 @@ func (c *Connection) Req(method string, path string, headers []HeaderPair, body 
 	}
 	c.doMu.Unlock()
 
-	if body != nil {
+	if withBody {
 		bufSize := int64(c.settings.MaxFrameSize)
 		if bufSize > c.flowControlWindow {
 			bufSize = c.flowControlWindow
 		}
-		if bl := int64(body.Len()); bufSize > bl {
+		if bl := int64(req.Body.Len()); bufSize > bl {
 			bufSize = bl
 		}
 
@@ -329,7 +339,7 @@ func (c *Connection) Req(method string, path string, headers []HeaderPair, body 
 			buf = make([]byte, bufSize)
 		}
 
-		bodyPos, bodyRest, bodyBuf := int64(0), int64(body.Len()), body.Bytes()
+		bodyPos, bodyRest, bodyBuf := int64(0), int64(req.Body.Len()), req.Body.Bytes()
 		for bodyRest > 0 {
 			wantSend := int64(c.settings.MaxFrameSize)
 			if wantSend > bodyRest {
