@@ -1,9 +1,7 @@
 package h2client
 
 import (
-	"fmt"
 	"github.com/pkg/errors"
-	"strconv"
 	"sync"
 )
 
@@ -44,7 +42,7 @@ func (p *ConnectionPool) Do(req *request) (*response, error) {
 }
 
 func (p *ConnectionPool) getConn(req *request) (conn *Connection, err error) {
-	poolKey := req.Host + `:` + strconv.Itoa(req.Port)
+	poolKey := req.getCacheKey()
 
 	p.poolMu.RLock()
 	hostPool, ok := p.pool[poolKey]
@@ -52,7 +50,7 @@ func (p *ConnectionPool) getConn(req *request) (conn *Connection, err error) {
 		p.poolMu.RUnlock()
 		p.poolMu.Lock()
 		if hostPool, ok = p.pool[poolKey]; !ok {
-			conn, err = NewConnection(req.Host, req.Port)
+			conn, err = NewConnection(req)
 			if err == nil {
 				p.pool[poolKey] = []*Connection{conn}
 			} else {
@@ -93,7 +91,7 @@ func (p *ConnectionPool) getConn(req *request) (conn *Connection, err error) {
 		return nil, errors.Wrap(ErrPoolCapacityLimit, `Limit check`)
 	}
 
-	conn, err = NewConnection(req.Host, req.Port)
+	conn, err = NewConnection(req)
 	if err != nil {
 		p.poolMu.Unlock()
 		return nil, errors.Wrap(err, `Cannot establish new connection`)
@@ -115,5 +113,5 @@ func (p *ConnectionPool) getConn(req *request) (conn *Connection, err error) {
 
 func (p *ConnectionPool) retConn(req *request, conn *Connection) {
 	conn.UnlockStream()
-	// уменьшать размер пула, если есть ненагружунные соединени
+	// ToDo: уменьшать размер пула, если есть ненагружунные соединения
 }

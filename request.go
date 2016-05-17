@@ -2,13 +2,21 @@ package h2client
 
 import (
 	"bytes"
+	"crypto/tls"
 	"github.com/pkg/errors"
 	"net"
 	"net/url"
+	"strconv"
+	"sync"
 	"time"
+	"unsafe"
 )
 
 type (
+	TLSConfig struct {
+		Certificates []tls.Certificate
+	}
+
 	request struct {
 		Method  string
 		Headers []HeaderPair
@@ -20,6 +28,11 @@ type (
 
 		DialTimeout time.Duration // ToDo: поддержать
 		Timeout     time.Duration // ToDo: поддержать
+
+		tlsConf   *TLSConfig
+		tlsConfMu sync.RWMutex
+
+		cacheKey string
 	}
 )
 
@@ -61,6 +74,23 @@ func (r *request) Reset() {
 
 	r.DialTimeout = 1 * time.Second
 	r.Timeout = 1 * time.Second
+
+	r.SetTLSConfig(nil)
+}
+
+func (r *request) SetTLSConfig(config *TLSConfig) {
+	r.tlsConfMu.Lock()
+	r.tlsConf = config
+	r.cacheKey = ``
+	r.tlsConfMu.Unlock()
+}
+
+func (r *request) getCacheKey() string {
+	if r.cacheKey == `` {
+		tlsConfPtr := strconv.FormatInt(int64(uintptr(unsafe.Pointer(r.tlsConf))), 16)
+		r.cacheKey = r.Host + `:` + strconv.Itoa(r.Port) + `:0x` + tlsConfPtr
+	}
+	return r.cacheKey
 }
 
 func (r *request) parseHostPort(parsedUrl *url.URL) error {

@@ -54,18 +54,28 @@ type (
 var (
 	clientConnectionPreface = []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
 	endianess               = binary.BigEndian
+	nextProto               = `h2`
 )
 
-func NewConnection(host string, port int) (*Connection, error) {
-	conn, err := tls.Dial(`tcp`, host+`:`+strconv.Itoa(port), &tls.Config{NextProtos: []string{`h2`}})
+func NewConnection(req *request) (*Connection, error) {
+	tlsConf := tls.Config{
+		NextProtos: []string{nextProto},
+	}
+	req.tlsConfMu.RLock()
+	if req.tlsConf != nil {
+		tlsConf.Certificates = req.tlsConf.Certificates
+	}
+	req.tlsConfMu.RUnlock()
+
+	conn, err := tls.Dial(`tcp`, req.Host+`:`+strconv.Itoa(req.Port), &tlsConf)
 	if err != nil {
 		return nil, errors.Wrap(err, `TLS connect fail`)
 	}
 
 	settings := GetDefaultSettings()
 	h2c := Connection{
-		host:              host,
-		port:              port,
+		host:              req.Host,
+		port:              req.Port,
 		conn:              conn,
 		connState:         ConnectionStateDisconn,
 		lastStreamId:      1, // нечетные для клиента, 1 стрим пропускается
