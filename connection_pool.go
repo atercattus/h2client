@@ -79,7 +79,7 @@ func (p *ConnectionPool) getConn(req *request) (conn *Connection, err error) {
 
 	p.poolMu.Lock()
 
-	hostPool, _ = p.pool[poolKey] // удалятся ключи (пока?) не будут
+	hostPool, _ = p.pool[poolKey] // удаляться ключи (пока?) не будут
 
 	for _, conn := range hostPool {
 		if conn.LockStream() {
@@ -115,4 +115,5 @@ func (p *ConnectionPool) getConn(req *request) (conn *Connection, err error) {
 
 func (p *ConnectionPool) retConn(req *request, conn *Connection) {
 	conn.UnlockStream()
+	// уменьшать размер пула, если есть ненагружунные соединени
 }

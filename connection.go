@@ -215,7 +215,7 @@ func (c *Connection) reader() {
 			case FrameTypeGoaway:
 				goawayFrame := frame.(*GoawayFrame)
 				fmt.Printf("GOAWAY %v\n", goawayFrame)
-				// ToDo: нужна нормальная обработка
+				// ToDo: нужна нормальная обработка: прерывание всех стримов на этом соединении
 
 			default:
 				panic(`WTF for connection frame type ` + frameHdr.Type.String())
