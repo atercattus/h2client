@@ -1,38 +1,41 @@
 package h2client
 
 import (
+	"fmt"
 	"github.com/pkg/errors"
-)
-
-const (
-	DefaultMaxIdleConnsPerHost = 2
+	"strconv"
+	"sync"
 )
 
 type (
 	ConnectionPool struct {
-		MaxIdleConnsPerHost int // ToDo: поддержка пула (host/ip+port)
+		pool            map[string][]*Connection
+		poolMu          sync.RWMutex
+		maxConnsPerHost int
 	}
 )
 
-func NewConnectionPool() *ConnectionPool {
+func NewConnectionPool(maxConnsPerHost int) *ConnectionPool {
 	pool := ConnectionPool{}
-	pool.MaxIdleConnsPerHost = DefaultMaxIdleConnsPerHost
+	pool.pool = make(map[string][]*Connection)
+
+	if maxConnsPerHost <= 0 {
+		maxConnsPerHost = 10
+	}
+	pool.maxConnsPerHost = maxConnsPerHost
+
 	return &pool
 }
 
 func (p *ConnectionPool) Do(req *request) (*response, error) {
-	if err := req.prepare(); err != nil {
-		return nil, errors.Wrap(err, `Wrong request`)
-	}
-
 	conn, err := p.getConn(req)
 	if err != nil {
 		return nil, errors.Wrap(err, `There are no available connections`)
 	}
 
-	resp, err := conn.Req(req)
+	resp, err := conn.reqWithLockedStream(req)
 	if err != nil {
-		err = errors.Wrap(err, `Do request fail`)
+		err = errors.Wrap(err, `Failed request execution`)
 	}
 
 	p.retConn(req, conn)
@@ -41,13 +44,76 @@ func (p *ConnectionPool) Do(req *request) (*response, error) {
 }
 
 func (p *ConnectionPool) getConn(req *request) (conn *Connection, err error) {
-	conn, err = NewConnection(req.Host, req.Port)
-	if err != nil {
-		err = errors.Wrap(err, `Cannot establist new connection`)
+	poolKey := req.Host + `:` + strconv.Itoa(req.Port)
+
+	p.poolMu.RLock()
+	hostPool, ok := p.pool[poolKey]
+	if !ok {
+		p.poolMu.RUnlock()
+		p.poolMu.Lock()
+		if hostPool, ok = p.pool[poolKey]; !ok {
+			conn, err = NewConnection(req.Host, req.Port)
+			if err == nil {
+				p.pool[poolKey] = []*Connection{conn}
+			} else {
+				err = errors.Wrap(err, `Cannot establish new connection`)
+			}
+			p.poolMu.Unlock()
+			return conn, err
+		}
+		p.poolMu.Unlock()
+		p.poolMu.RLock()
 	}
-	return
+
+	for _, conn := range hostPool {
+		if conn.LockStream() {
+			p.poolMu.RUnlock()
+			return conn, nil
+		}
+	}
+
+	p.poolMu.RUnlock()
+
+	// Все имеющиеся в пуле соединения нагружены по полной.
+	// Нужно выделить еще один коннект (еси не превысили лимит).
+
+	p.poolMu.Lock()
+
+	hostPool, _ = p.pool[poolKey] // удалятся ключи (пока?) не будут
+
+	for _, conn := range hostPool {
+		if conn.LockStream() {
+			p.poolMu.Unlock()
+			return conn, nil
+		}
+	}
+
+	if len(hostPool) >= p.maxConnsPerHost {
+		p.poolMu.Unlock()
+		return nil, errors.Wrap(ErrPoolCapacityLimit, `Limit check`)
+	}
+
+	conn, err = NewConnection(req.Host, req.Port)
+	fmt.Printf("NewConnection(%s, %d)\n", req.Host, req.Port)
+	if err != nil {
+		p.poolMu.Unlock()
+		return nil, errors.Wrap(err, `Cannot establish new connection`)
+	}
+
+	if !conn.LockStream() {
+		conn.Close()
+		p.poolMu.Unlock()
+		return nil, errors.Wrap(ErrBug, `Cannot lock stream on new connection`)
+	}
+
+	hostPool = append(hostPool, conn)
+	p.pool[poolKey] = hostPool
+
+	p.poolMu.Unlock()
+
+	return conn, nil
 }
 
 func (p *ConnectionPool) retConn(req *request, conn *Connection) {
-	conn.Close()
+	conn.UnlockStream()
 }

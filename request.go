@@ -10,18 +10,13 @@ import (
 
 type (
 	request struct {
-		prepared bool
-
 		Method  string
 		Headers []HeaderPair
 		Body    *bytes.Buffer
 
-		// Url имеет больший приоритет, чем Host, Path и Port
-		Url  string
 		Host string
 		Port int
 		Path string
-		//Ip       net.IP
 
 		DialTimeout time.Duration // ToDo: поддержать
 		Timeout     time.Duration // ToDo: поддержать
@@ -34,42 +29,8 @@ func NewRequest() *request {
 	return &req
 }
 
-func (r *request) Reset() {
-	r.prepared = false
-
-	r.Method = `GET`
-	r.Headers = r.Headers[0:0]
-	if r.Body != nil {
-		r.Body.Reset()
-	}
-	r.Url = ``
-	r.Host = ``
-	r.Port = 443
-	r.Path = ``
-	//r.Ip = r.Ip[0:0]
-
-	r.DialTimeout = 1 * time.Second
-	r.Timeout = 1 * time.Second
-}
-
-func (r *request) prepare() error {
-	if r.prepared {
-		return nil
-	}
-
-	if r.Url != `` {
-		if err := r.parseUrl(); err != nil {
-			return errors.Wrap(err, `Cannot parse URL`)
-		}
-	}
-
-	r.prepared = true
-
-	return nil
-}
-
-func (r *request) parseUrl() error {
-	parsedUrl, err := url.Parse(r.Url)
+func (r *request) ParseUrl(url_ string) error {
+	parsedUrl, err := url.Parse(url_)
 	if err != nil {
 		return errors.Wrap(err, `Parse URL fail`)
 	} else if parsedUrl.Scheme != `https` {
@@ -88,8 +49,22 @@ func (r *request) parseUrl() error {
 	return nil
 }
 
+func (r *request) Reset() {
+	r.Method = `GET`
+	r.Headers = r.Headers[0:0]
+	if r.Body != nil {
+		r.Body.Reset()
+	}
+	r.Host = ``
+	r.Port = 443
+	r.Path = ``
+
+	r.DialTimeout = 1 * time.Second
+	r.Timeout = 1 * time.Second
+}
+
 func (r *request) parseHostPort(parsedUrl *url.URL) error {
-	// ToDo: кешировать разбор
+	// ToDo: кешировать разбор ?
 	var (
 		portStr string
 		err     error
@@ -102,13 +77,6 @@ func (r *request) parseHostPort(parsedUrl *url.URL) error {
 	} else if r.Port, err = net.LookupPort(`tcp4`, portStr); err != nil {
 		return errors.Wrap(err, `Wrong port format`)
 	}
-
-	/*host := r.Host + `:` + strconv.Itoa(r.Port)
-	addr, err := net.ResolveTCPAddr(`tcp`, host)
-	if err != nil {
-		return errors.Wrap(err, `Cannot resolve URL`)
-	}
-	r.Ip = addr.IP*/
 
 	return nil
 }

@@ -45,6 +45,7 @@ type (
 		// ToDo: операции с flowControlWindow должны идти через atomic или иным способом быть атомарными
 
 		streamsActive   map[uint32]*connectionStream
+		streamsReserved int32 // сколько стримов используются в соединении. может быть больше len(streamsActive), но всегда не больше settings.MaxConcurrentStreams
 		streamsActiveMu sync.RWMutex
 
 		limitedReader io.LimitedReader
@@ -57,10 +58,6 @@ var (
 )
 
 func NewConnection(host string, port int) (*Connection, error) {
-	// ToDo: а такой вариант будет работать с подключением по ip?
-	// var c net.Conn = ...
-	// conn, err := tls.Client(c, &tls.Config{)
-
 	conn, err := tls.Dial(`tcp`, host+`:`+strconv.Itoa(port), &tls.Config{NextProtos: []string{`h2`}})
 	if err != nil {
 		return nil, errors.Wrap(err, `TLS connect fail`)
@@ -110,6 +107,22 @@ func NewConnection(host string, port int) (*Connection, error) {
 	go h2c.reader()
 
 	return &h2c, nil
+}
+
+func (c *Connection) LockStream() bool {
+	if cnt := atomic.AddInt32(&c.streamsReserved, 1); int64(cnt) <= int64(c.settings.MaxConcurrentStreams) {
+		return true
+	}
+	atomic.AddInt32(&c.streamsReserved, -1)
+	return false
+}
+
+func (c *Connection) UnlockStream() bool {
+	if cnt := atomic.AddInt32(&c.streamsReserved, -1); cnt >= 0 {
+		return true
+	}
+	atomic.AddInt32(&c.streamsReserved, 1)
+	return false
 }
 
 func (c *Connection) writeChunks(chunks ...[]byte) error {
@@ -198,7 +211,6 @@ func (c *Connection) reader() {
 
 			case FrameTypeWindowUpdate:
 				windowUpdateFrame := frame.(*WindowUpdateFrame)
-				// windowUpdateFrame.StreamId == 0
 				c.flowControlWindow += int64(windowUpdateFrame.WindowSizeIncrement)
 
 			case FrameTypeGoaway:
@@ -219,7 +231,6 @@ func (c *Connection) reader() {
 		if !ok {
 			// Сюда попадаем (по хорошему) для уже отработанных стримов, по которым еще долетают фреймы.
 			// Просто игнорируем такие фреймы.
-			//fmt.Printf("unexpected frame recv: %v\n", frame)
 			continue
 		}
 
@@ -257,8 +268,13 @@ func (c *Connection) reader() {
 
 		case FrameTypeRstStream:
 			rstStreamFrame := frame.(*RstStreamFrame)
-			fmt.Printf("RST_STREAM %v\n", rstStreamFrame)
-			// ToDo: нужна нормальная обработка
+
+			c.streamsActiveMu.Lock()
+			fmt.Println(`RST_STREAM`, rstStreamFrame.ErrorCode, len(c.streamsActive)) // debug output
+			delete(c.streamsActive, frameHdr.StreamId)
+			c.streamsActiveMu.Unlock()
+
+			stream.respWait <- respWaitItem{streamId: stream.streamId, succ: false}
 
 		case FrameTypeWindowUpdate:
 			// ToDo: обработка конкретного фрейма
@@ -275,16 +291,24 @@ func (c *Connection) reader() {
 			delete(c.streamsActive, frameHdr.StreamId)
 			c.streamsActiveMu.Unlock()
 
-			stream.respWait <- struct{}{}
+			stream.respWait <- respWaitItem{streamId: stream.streamId, succ: true}
 		}
 	}
 }
 
 func (c *Connection) Req(req *request) (*response, error) {
-	if err := req.prepare(); err != nil {
-		return nil, errors.Wrap(err, `Wrong request`)
+	if !c.LockStream() {
+		return nil, errors.Wrap(ErrPoolCapacityLimit, `There are no capacity for new stream in connection`)
 	}
 
+	resp, err := c.reqWithLockedStream(req)
+
+	c.UnlockStream()
+
+	return resp, err
+}
+
+func (c *Connection) reqWithLockedStream(req *request) (*response, error) {
 	if c.connState == ConnectionStateClosed {
 		return nil, errors.Wrap(ErrConnectionAlreadyClosed, `Cannot work over closed connection`)
 	}
@@ -303,6 +327,7 @@ func (c *Connection) Req(req *request) (*response, error) {
 	streamIdx := atomic.AddUint32(&c.lastStreamId, 2)
 	stream := c.pollStream.Get().(*connectionStream)
 	stream.Reset(c)
+	stream.streamId = streamIdx
 
 	c.streamsActiveMu.Lock()
 	c.streamsActive[streamIdx] = stream
@@ -367,7 +392,17 @@ func (c *Connection) Req(req *request) (*response, error) {
 	}
 
 	// recv response
-	<-stream.respWait
+	for respItem := range stream.respWait {
+		if respItem.streamId == streamIdx {
+			// это ответ на наш запрос, все хорошо
+			if !respItem.succ {
+				stream.resp.Canceled = true
+			}
+			break
+		}
+		// к нам долетел ответ на стрим, который раньше вовремя не ответил
+		// повторяем ожидание
+	}
 
 	return &stream.resp, nil
 }

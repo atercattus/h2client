@@ -1,26 +1,30 @@
 package h2client
 
 type (
+	respWaitItem struct {
+		streamId uint32
+		succ     bool
+	}
+
 	connectionStream struct {
-		conn     *Connection
-		resp     response
-		respWait chan struct{}
+		streamId          uint32
+		conn              *Connection
+		flowControlWindow int64 // ToDo: реализовать
+		resp              response
+		respWait          chan respWaitItem
 	}
 )
 
 func newStream(conn *Connection) *connectionStream {
 	stream := connectionStream{}
-	stream.respWait = make(chan struct{})
+	stream.respWait = make(chan respWaitItem)
 	stream.Reset(conn)
 	return &stream
 }
 
 func (s *connectionStream) Reset(conn *Connection) {
 	s.conn = conn
-	s.resp.stream = s
-	s.resp.Status = 0
-	s.resp.Body.Reset()
-	s.resp.Headers = s.resp.Headers[0:0]
+	s.resp.Reset(s)
 	select {
 	case <-s.respWait:
 	default:
