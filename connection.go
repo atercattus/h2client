@@ -42,7 +42,6 @@ type (
 		hpackEncoderBuffer bytes.Buffer
 
 		flowControlWindow int64 // это лимит удаленной стороны, который мы уменьшаем, когда МЫ отсылаем DATA фреймы, а не когда их присылают нам
-		// ToDo: операции с flowControlWindow должны идти через atomic или иным способом быть атомарными
 
 		streamsActive   map[uint32]*connectionStream
 		streamsReserved int32 // сколько стримов используются в соединении. может быть больше len(streamsActive), но всегда не больше settings.MaxConcurrentStreams
@@ -211,7 +210,7 @@ func (c *Connection) reader() {
 
 			case FrameTypeWindowUpdate:
 				windowUpdateFrame := frame.(*WindowUpdateFrame)
-				c.flowControlWindow += int64(windowUpdateFrame.WindowSizeIncrement)
+				atomic.AddInt64(&c.flowControlWindow, int64(windowUpdateFrame.WindowSizeIncrement))
 
 			case FrameTypeGoaway:
 				goawayFrame := frame.(*GoawayFrame)
@@ -274,13 +273,11 @@ func (c *Connection) reader() {
 			delete(c.streamsActive, frameHdr.StreamId)
 			c.streamsActiveMu.Unlock()
 
-			stream.respWait <- respWaitItem{streamId: stream.streamId, succ: false}
+			stream.respWait <- respWaitItem{streamId: stream.id, succ: false}
 
 		case FrameTypeWindowUpdate:
-			// ToDo: обработка конкретного фрейма
-			//windowUpdateFrame := frame.(*WindowUpdateFrame)
-			// windowUpdateFrame.StreamId != 0
-			//c.flowControlWindow += int64(windowUpdateFrame.WindowSizeIncrement)
+			windowUpdateFrame := frame.(*WindowUpdateFrame)
+			atomic.AddInt64(&stream.flowControlWindow, int64(windowUpdateFrame.WindowSizeIncrement))
 
 		default:
 			panic(`WTF for stream frame type ` + frameHdr.Type.String())
@@ -291,7 +288,7 @@ func (c *Connection) reader() {
 			delete(c.streamsActive, frameHdr.StreamId)
 			c.streamsActiveMu.Unlock()
 
-			stream.respWait <- respWaitItem{streamId: stream.streamId, succ: true}
+			stream.respWait <- respWaitItem{streamId: stream.id, succ: true}
 		}
 	}
 }
@@ -327,7 +324,7 @@ func (c *Connection) reqWithLockedStream(req *request) (*response, error) {
 	streamIdx := atomic.AddUint32(&c.lastStreamId, 2)
 	stream := c.pollStream.Get().(*connectionStream)
 	stream.Reset(c)
-	stream.streamId = streamIdx
+	stream.id = streamIdx
 
 	c.streamsActiveMu.Lock()
 	c.streamsActive[streamIdx] = stream
@@ -351,44 +348,9 @@ func (c *Connection) reqWithLockedStream(req *request) (*response, error) {
 	c.doMu.Unlock()
 
 	if withBody {
-		bufSize := int64(c.settings.MaxFrameSize)
-		if bufSize > c.flowControlWindow {
-			bufSize = c.flowControlWindow
+		if err := c.sendRequestBody(req, stream); err != nil {
+			return nil, errors.Wrap(err, `Cannot send request body payload`)
 		}
-		if bl := int64(req.Body.Len()); bufSize > bl {
-			bufSize = bl
-		}
-
-		buf := c.pollByteSlice.Get().([]byte)[:]
-		if int64(cap(buf)) < bufSize {
-			buf = make([]byte, bufSize)
-		}
-
-		bodyPos, bodyRest, bodyBuf := int64(0), int64(req.Body.Len()), req.Body.Bytes()
-		for bodyRest > 0 {
-			wantSend := int64(c.settings.MaxFrameSize)
-			if wantSend > bodyRest {
-				wantSend = bodyRest
-			}
-
-			for wantSend > c.flowControlWindow {
-				time.Sleep(10 * time.Millisecond)
-				continue
-			}
-
-			flags := FrameFlags(0)
-			if wantSend == bodyRest {
-				flags |= FlagEndStream
-			}
-			err := c.sendFrame(FrameTypeData, flags, streamIdx, bodyBuf[bodyPos:bodyPos+wantSend])
-			if err != nil {
-				c.pollByteSlice.Put(buf)
-				return nil, errors.Wrap(err, `Send data frame fail`)
-			}
-			c.flowControlWindow -= wantSend
-			bodyRest -= wantSend
-		}
-		c.pollByteSlice.Put(buf)
 	}
 
 	// recv response
@@ -405,6 +367,42 @@ func (c *Connection) reqWithLockedStream(req *request) (*response, error) {
 	}
 
 	return &stream.resp, nil
+}
+
+func (c *Connection) sendRequestBody(req *request, stream *connectionStream) error {
+	bodyPos, bodyRest, bodyBuf := int64(0), int64(req.Body.Len()), req.Body.Bytes()
+	for bodyRest > 0 {
+		wantSend := int64(c.settings.MaxFrameSize)
+		if wantSend > bodyRest {
+			wantSend = bodyRest
+		}
+
+		for {
+			connFcw := atomic.LoadInt64(&c.flowControlWindow)
+			streamFcw := atomic.LoadInt64(&stream.flowControlWindow)
+
+			if (wantSend <= connFcw) && (wantSend <= streamFcw) {
+				// Тут возможна ситуация гонок на flowControlWindow, но по RFC мы можем немного уходить в "минус"
+				atomic.AddInt64(&c.flowControlWindow, -wantSend)
+				atomic.AddInt64(&stream.flowControlWindow, -wantSend)
+				break
+			}
+
+			time.Sleep(50 * time.Millisecond)
+		}
+
+		flags := FrameFlags(0)
+		if wantSend == bodyRest {
+			flags |= FlagEndStream
+		}
+		err := c.sendFrame(FrameTypeData, flags, stream.id, bodyBuf[bodyPos:bodyPos+wantSend])
+		if err != nil {
+			// В теории, можно бы увеличивать flowControlWindow, коли не отправили. Но нужно ли?
+			return errors.Wrap(err, `Send data frame fail`)
+		}
+		bodyRest -= wantSend
+	}
+	return nil
 }
 
 func (c *Connection) buildRequestPayload(method string, path string, headers []HeaderPair) (*bytes.Buffer, error) {

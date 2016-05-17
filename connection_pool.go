@@ -94,7 +94,6 @@ func (p *ConnectionPool) getConn(req *request) (conn *Connection, err error) {
 	}
 
 	conn, err = NewConnection(req.Host, req.Port)
-	fmt.Printf("NewConnection(%s, %d)\n", req.Host, req.Port)
 	if err != nil {
 		p.poolMu.Unlock()
 		return nil, errors.Wrap(err, `Cannot establish new connection`)

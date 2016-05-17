@@ -7,9 +7,9 @@ type (
 	}
 
 	connectionStream struct {
-		streamId          uint32
+		id                uint32
 		conn              *Connection
-		flowControlWindow int64 // ToDo: реализовать
+		flowControlWindow int64
 		resp              response
 		respWait          chan respWaitItem
 	}
