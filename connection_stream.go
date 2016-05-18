@@ -25,6 +25,7 @@ func newStream(conn *Connection) *connectionStream {
 func (s *connectionStream) Reset(conn *Connection) {
 	s.conn = conn
 	s.resp.Reset(s)
+	s.flowControlWindow = 65535
 	select {
 	case <-s.respWait:
 	default:

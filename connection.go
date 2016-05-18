@@ -335,6 +335,7 @@ func (c *Connection) reqWithLockedStream(req *request) (*response, error) {
 	stream := c.pollStream.Get().(*connectionStream)
 	stream.Reset(c)
 	stream.id = streamIdx
+	stream.flowControlWindow = int64(c.settings.InitialWindowSize)
 
 	c.streamsActiveMu.Lock()
 	c.streamsActive[streamIdx] = stream
@@ -345,7 +346,7 @@ func (c *Connection) reqWithLockedStream(req *request) (*response, error) {
 	withBody := (req.Body != nil) && (req.Body.Len() > 0)
 
 	flags := FlagEndHeaders
-	if withBody {
+	if !withBody {
 		flags |= FlagEndStream
 	}
 
@@ -450,6 +451,7 @@ func (c *Connection) sendFrame(type_ FrameType, flags FrameFlags, streamId uint3
 		return errors.Wrap(err, `Build frame failed`)
 	}
 
+	//fmt.Println(`send`, FrameHdr{uint32(len(payload)), type_, flags, streamId}, string(payload))
 	err := c.writeChunks(buf.Bytes())
 
 	c.pollBytesBuffer.Put(buf)

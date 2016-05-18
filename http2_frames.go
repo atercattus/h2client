@@ -2,6 +2,7 @@ package h2client
 
 import (
 	"bytes"
+	"fmt"
 )
 
 type (
@@ -93,4 +94,8 @@ type (
 
 func (fh FrameHdr) Hdr() FrameHdr {
 	return fh
+}
+
+func (fh FrameHdr) String() string {
+	return fmt.Sprintf(`FrameHdr{Length:%d, Type:%s, Flags:%s, StreamId:%d}`, fh.Length, fh.Type, fh.Flags, fh.StreamId)
 }
