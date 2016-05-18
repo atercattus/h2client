@@ -8,6 +8,7 @@ import (
 	"github.com/pkg/errors"
 	"golang.org/x/net/http2/hpack"
 	"io"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -21,6 +22,7 @@ type (
 		host string
 		port int
 
+		tcpConn     net.Conn
 		conn        *tls.Conn
 		connReadMu  sync.Mutex
 		connWriteMu sync.Mutex
@@ -60,6 +62,7 @@ var (
 func NewConnection(req *request) (*Connection, error) {
 	tlsConf := tls.Config{
 		NextProtos: []string{nextProto},
+		ServerName: req.Host,
 	}
 	req.tlsConfMu.RLock()
 	if req.tlsConf != nil {
@@ -67,15 +70,21 @@ func NewConnection(req *request) (*Connection, error) {
 	}
 	req.tlsConfMu.RUnlock()
 
-	conn, err := tls.Dial(`tcp`, req.Host+`:`+strconv.Itoa(req.Port), &tlsConf)
+	tcpConn, err := net.DialTimeout(`tcp`, req.Host+`:`+strconv.Itoa(req.Port), req.DialTimeout)
 	if err != nil {
-		return nil, errors.Wrap(err, `TLS connect fail`)
+		return nil, errors.Wrap(err, `TCP connect fail`)
+	}
+
+	conn := tls.Client(tcpConn, &tlsConf)
+	if err := conn.Handshake(); err != nil {
+		return nil, errors.Wrap(err, `TLS handshake fail`)
 	}
 
 	settings := GetDefaultSettings()
 	h2c := Connection{
 		host:              req.Host,
 		port:              req.Port,
+		tcpConn:           tcpConn,
 		conn:              conn,
 		connState:         ConnectionStateDisconn,
 		lastStreamId:      1, // нечетные для клиента, 1 стрим пропускается
