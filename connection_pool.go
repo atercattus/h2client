@@ -6,8 +6,13 @@ import (
 )
 
 type (
+	connectionPoolItem struct {
+		sync.RWMutex
+		conns []*Connection
+	}
+
 	ConnectionPool struct {
-		pool            map[string][]*Connection
+		pool            map[string]*connectionPoolItem
 		poolMu          sync.RWMutex
 		maxConnsPerHost int
 	}
@@ -15,7 +20,7 @@ type (
 
 func NewConnectionPool(maxConnsPerHost int) *ConnectionPool {
 	pool := ConnectionPool{}
-	pool.pool = make(map[string][]*Connection)
+	pool.pool = make(map[string]*connectionPoolItem)
 
 	if maxConnsPerHost <= 0 {
 		maxConnsPerHost = 10
@@ -50,68 +55,59 @@ func (p *ConnectionPool) getConn(req *request) (conn *Connection, err error) {
 		p.poolMu.RUnlock()
 		p.poolMu.Lock()
 		if hostPool, ok = p.pool[poolKey]; !ok {
-			conn, err = NewConnection(req)
-			if err == nil {
-				p.pool[poolKey] = []*Connection{conn}
-			} else {
-				err = errors.Wrap(err, `Cannot establish new connection`)
-			}
-			p.poolMu.Unlock()
-			return conn, err
+			hostPool = &connectionPoolItem{}
+			p.pool[poolKey] = hostPool
 		}
 		p.poolMu.Unlock()
-		p.poolMu.RLock()
+	} else {
+		p.poolMu.RUnlock()
 	}
 
-	for _, conn := range hostPool {
+	hostPool.RLock()
+	for _, conn := range hostPool.conns {
 		if conn.LockStream() {
-			p.poolMu.RUnlock()
+			hostPool.RUnlock()
 			return conn, nil
 		}
 	}
-
-	p.poolMu.RUnlock()
+	hostPool.RUnlock()
 
 	// Все имеющиеся в пуле соединения нагружены по полной.
 	// Нужно выделить еще один коннект (еси не превысили лимит).
 
-	p.poolMu.Lock()
+	hostPool.Lock()
 
-	hostPool, _ = p.pool[poolKey] // удаляться ключи (пока?) не будут
-
-	for _, conn := range hostPool {
+	for _, conn := range hostPool.conns {
 		if conn.LockStream() {
-			p.poolMu.Unlock()
+			hostPool.Unlock()
 			return conn, nil
 		}
 	}
 
-	if len(hostPool) >= p.maxConnsPerHost {
-		p.poolMu.Unlock()
+	if len(hostPool.conns) >= p.maxConnsPerHost {
+		hostPool.Unlock()
 		return nil, errors.Wrap(ErrPoolCapacityLimit, `Limit check`)
 	}
 
-	conn, err = NewConnection(req)
-	if err != nil {
-		p.poolMu.Unlock()
+	if conn, err = NewConnection(req); err != nil {
+		hostPool.Unlock()
 		return nil, errors.Wrap(err, `Cannot establish new connection`)
 	}
 
 	if !conn.LockStream() {
 		conn.Close()
-		p.poolMu.Unlock()
+		hostPool.Unlock()
 		return nil, errors.Wrap(ErrBug, `Cannot lock stream on new connection`)
 	}
 
-	hostPool = append(hostPool, conn)
-	p.pool[poolKey] = hostPool
+	hostPool.conns = append(hostPool.conns, conn)
 
-	p.poolMu.Unlock()
+	hostPool.Unlock()
 
 	return conn, nil
 }
 
 func (p *ConnectionPool) retConn(req *request, conn *Connection) {
 	conn.UnlockStream()
-	// ToDo: уменьшать размер пула, если есть ненагружунные соединения
+	// ToDo: уменьшать размер пула, если есть пустые соединения (заодно ввести MaxIdleConnsPerHost и выкинуть(?) maxConnsPerHost)
 }
