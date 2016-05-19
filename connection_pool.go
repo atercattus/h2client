@@ -1,6 +1,7 @@
 package h2client
 
 import (
+	"fmt"
 	"github.com/pkg/errors"
 	"sync"
 )
@@ -68,6 +69,8 @@ func (p *ConnectionPool) getConn(req *request) (conn *Connection, err error) {
 		if conn.LockStream() {
 			hostPool.RUnlock()
 			return conn, nil
+		} else if conn.HasGoAwayFrames() {
+			fmt.Println(`conn for req`, req.getCacheKey(), `has GOAWAY frames#1:`, conn.GetGoAwayFrames())
 		}
 	}
 	hostPool.RUnlock()
@@ -81,6 +84,8 @@ func (p *ConnectionPool) getConn(req *request) (conn *Connection, err error) {
 		if conn.LockStream() {
 			hostPool.Unlock()
 			return conn, nil
+		} else if conn.HasGoAwayFrames() {
+			fmt.Println(`conn for req`, req.getCacheKey(), `has GOAWAY frames#2:`, conn.GetGoAwayFrames())
 		}
 	}
 
@@ -89,12 +94,16 @@ func (p *ConnectionPool) getConn(req *request) (conn *Connection, err error) {
 		return nil, errors.Wrap(ErrPoolCapacityLimit, `Limit check`)
 	}
 
+	fmt.Println(`NewConnection`, req.getCacheKey())
 	if conn, err = NewConnection(req); err != nil {
 		hostPool.Unlock()
 		return nil, errors.Wrap(err, `Cannot establish new connection`)
 	}
 
 	if !conn.LockStream() {
+		if conn.HasGoAwayFrames() {
+			fmt.Println(`conn for req`, req.getCacheKey(), `has GOAWAY frames#3:`, conn.GetGoAwayFrames())
+		}
 		conn.Close()
 		hostPool.Unlock()
 		return nil, errors.Wrap(ErrBug, `Cannot lock stream on new connection`)

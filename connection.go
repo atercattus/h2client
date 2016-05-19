@@ -50,6 +50,9 @@ type (
 		streamsActiveMu sync.RWMutex
 
 		limitedReader io.LimitedReader
+
+		goawayFrames   []*GoawayFrame
+		goawayFramesMu sync.RWMutex
 	}
 )
 
@@ -128,6 +131,15 @@ func NewConnection(req *request) (*Connection, error) {
 }
 
 func (c *Connection) LockStream() bool {
+	c.goawayFramesMu.RLock()
+	emptyGoAways := len(c.goawayFrames) == 0
+	c.goawayFramesMu.RUnlock()
+
+	if !emptyGoAways {
+		// после получения GOAWAY создавать новые стримы на данном соединении уже нельзя
+		return false
+	}
+
 	if cnt := atomic.AddInt32(&c.streamsReserved, 1); int64(cnt) <= int64(c.settings.MaxConcurrentStreams) {
 		return true
 	}
@@ -139,8 +151,25 @@ func (c *Connection) UnlockStream() bool {
 	if cnt := atomic.AddInt32(&c.streamsReserved, -1); cnt >= 0 {
 		return true
 	}
-	atomic.AddInt32(&c.streamsReserved, 1)
+	cnt := atomic.AddInt32(&c.streamsReserved, 1)
+	if cnt == 0 {
+		fmt.Println(`Conn EMPTY`)
+	}
 	return false
+}
+
+func (c *Connection) GetGoAwayFrames() (frames []*GoawayFrame) {
+	c.goawayFramesMu.RLock()
+	frames = c.goawayFrames
+	c.goawayFramesMu.RUnlock()
+	return
+}
+
+func (c *Connection) HasGoAwayFrames() (has bool) {
+	c.goawayFramesMu.RLock()
+	has = len(c.goawayFrames) > 0
+	c.goawayFramesMu.RUnlock()
+	return
 }
 
 func (c *Connection) writeChunks(chunks ...[]byte) error {
@@ -203,8 +232,15 @@ func (c *Connection) reader() {
 	for c.connState != ConnectionStateClosed {
 		frame, err := c.recvFrame()
 		if err != nil {
+			os.Stderr.WriteString(`h2client.Connection.recvFrame error: `)
 			errors.Fprint(os.Stderr, err)
-			return
+
+			if causeErr := errors.Cause(err); causeErr == io.EOF || causeErr == io.ErrUnexpectedEOF {
+				c.Close()
+				return
+			}
+
+			continue // или выйти?
 		}
 
 		frameHdr := frame.Hdr()
@@ -219,7 +255,9 @@ func (c *Connection) reader() {
 				if frame.Hdr().Flags&FlagAck == 0 {
 					// не нужно отсылать ACK на пришедший ACK :)
 					if err := c.sendFrame(FrameTypeSettings, FlagAck, 0, nil); err != nil {
-						panic(errors.Wrap(err, `Cannot send answer to SETTINGS frame`))
+						os.Stderr.WriteString(`Cannot send answer to SETTINGS frame`)
+						c.Close()
+						return
 					}
 				}
 
@@ -233,11 +271,12 @@ func (c *Connection) reader() {
 
 			case FrameTypeGoaway:
 				goawayFrame := frame.(*GoawayFrame)
-				fmt.Printf("GOAWAY %v\n", goawayFrame)
-				// ToDo: нужна нормальная обработка и запрет новых стримов на этом соединении
+				c.goawayFramesMu.Lock()
+				c.goawayFrames = append(c.goawayFrames, goawayFrame)
+				c.goawayFramesMu.Unlock()
 
 			default:
-				panic(`WTF for connection frame type ` + frameHdr.Type.String())
+				// игнорируем незнакомые типы фреймов
 			}
 
 			continue
@@ -299,7 +338,7 @@ func (c *Connection) reader() {
 			atomic.AddInt64(&stream.flowControlWindow, int64(windowUpdateFrame.WindowSizeIncrement))
 
 		default:
-			panic(`WTF for stream frame type ` + frameHdr.Type.String())
+			// по документации мы должны игнорировать не известные фреймы
 		}
 
 		if frameHdr.Flags&FlagEndStream != 0 {
@@ -314,7 +353,13 @@ func (c *Connection) reader() {
 
 func (c *Connection) Req(req *request) (*response, error) {
 	if !c.LockStream() {
-		return nil, errors.Wrap(ErrPoolCapacityLimit, `There are no capacity for new stream in connection`)
+		var err error
+		if c.HasGoAwayFrames() {
+			err = ErrGoAwayRecieved
+		} else {
+			err = ErrPoolCapacityLimit
+		}
+		return nil, errors.Wrap(err, `There are no capacity for new stream in connection`)
 	}
 
 	resp, err := c.reqWithLockedStream(req)

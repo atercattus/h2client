@@ -18,6 +18,7 @@ const (
 	ErrConnectionAlreadyClosed = ErrProtocol(`Connection already closed`)
 
 	ErrPoolCapacityLimit = ErrCommon(`Pool capacity limit`)
+	ErrGoAwayRecieved    = ErrCommon(`GOAWAY frame received on connection`)
 	ErrBug               = ErrCommon(`Bug`)
 )
 
