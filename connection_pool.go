@@ -70,7 +70,7 @@ func (p *ConnectionPool) getConn(req *request) (conn *Connection, err error) {
 			hostPool.RUnlock()
 			return conn, nil
 		} else if conn.HasGoAwayFrames() {
-			fmt.Println(`conn for req`, req.getCacheKey(), `has GOAWAY frames#1:`, conn.GetGoAwayFrames())
+			// соединение должно быть закрыто, когда все стримы в нем отработают
 		}
 	}
 	hostPool.RUnlock()
@@ -85,7 +85,7 @@ func (p *ConnectionPool) getConn(req *request) (conn *Connection, err error) {
 			hostPool.Unlock()
 			return conn, nil
 		} else if conn.HasGoAwayFrames() {
-			fmt.Println(`conn for req`, req.getCacheKey(), `has GOAWAY frames#2:`, conn.GetGoAwayFrames())
+			// соединение должно быть закрыто, когда все стримы в нем отработают
 		}
 	}
 
@@ -94,7 +94,6 @@ func (p *ConnectionPool) getConn(req *request) (conn *Connection, err error) {
 		return nil, errors.Wrap(ErrPoolCapacityLimit, `Limit check`)
 	}
 
-	fmt.Println(`NewConnection`, req.getCacheKey())
 	if conn, err = NewConnection(req); err != nil {
 		hostPool.Unlock()
 		return nil, errors.Wrap(err, `Cannot establish new connection`)
@@ -102,7 +101,7 @@ func (p *ConnectionPool) getConn(req *request) (conn *Connection, err error) {
 
 	if !conn.LockStream() {
 		if conn.HasGoAwayFrames() {
-			fmt.Println(`conn for req`, req.getCacheKey(), `has GOAWAY frames#3:`, conn.GetGoAwayFrames())
+			// ToDo: уже GOAWAY? соединение вообще забанено?
 		}
 		conn.Close()
 		hostPool.Unlock()
