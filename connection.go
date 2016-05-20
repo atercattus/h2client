@@ -19,6 +19,8 @@ import (
 
 type (
 	Connection struct {
+		Logger io.Writer
+
 		host string
 		port int
 
@@ -53,6 +55,9 @@ type (
 
 		goawayFrames   []*GoawayFrame
 		goawayFramesMu sync.RWMutex
+
+		readTimeout  time.Duration
+		writeTimeout time.Duration
 	}
 )
 
@@ -61,6 +66,22 @@ var (
 	endianess               = binary.BigEndian
 	nextProto               = `h2`
 )
+
+var (
+	// nowCached обновляется примерно каждые 10мс
+	nowCached time.Time
+)
+
+func init() {
+	nowCached = time.Now()
+	go func() {
+		t := time.Tick(10 * time.Millisecond)
+		for {
+			<-t
+			nowCached = time.Now()
+		}
+	}()
+}
 
 func NewConnection(req *request) (*Connection, error) {
 	tlsConf := tls.Config{
@@ -85,6 +106,8 @@ func NewConnection(req *request) (*Connection, error) {
 
 	settings := GetDefaultSettings()
 	h2c := Connection{
+		Logger: os.Stderr, // ioutil.Discard,
+
 		host:              req.Host,
 		port:              req.Port,
 		tcpConn:           tcpConn,
@@ -94,6 +117,9 @@ func NewConnection(req *request) (*Connection, error) {
 		settings:          settings,
 		flowControlWindow: int64(settings.InitialWindowSize),
 		streamsActive:     make(map[uint32]*connectionStream),
+
+		readTimeout:  1 * time.Second,
+		writeTimeout: 1 * time.Second,
 	}
 
 	h2c.pollBytesBuffer.New = func() interface{} {
@@ -140,6 +166,11 @@ func (c *Connection) LockStream() bool {
 		return false
 	}
 
+	if fcw := atomic.LoadInt64(&c.flowControlWindow); fcw < 512 {
+		// окна почти нет, лучше взять другое соединение. НУЖНО ТЕСТИТЬ ТАКОЙ ЗАПРЕТ!
+		return false
+	}
+
 	if cnt := atomic.AddInt32(&c.streamsReserved, 1); int64(cnt) <= int64(c.settings.MaxConcurrentStreams) {
 		return true
 	}
@@ -153,7 +184,7 @@ func (c *Connection) UnlockStream() bool {
 	}
 	cnt := atomic.AddInt32(&c.streamsReserved, 1)
 	if cnt == 0 {
-		fmt.Println(`Conn EMPTY`)
+		c.Logger.Write([]byte("Conn EMPTY\n")) // ToDo: закрывать соединение?
 	}
 	return false
 }
@@ -174,8 +205,9 @@ func (c *Connection) HasGoAwayFrames() (has bool) {
 
 func (c *Connection) writeChunks(chunks ...[]byte) error {
 	c.connWriteMu.Lock()
+	c.conn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
 	for _, chunk := range chunks {
-		if _, err := c.conn.Write(chunk); err != nil { // ToDo: timeout
+		if _, err := c.conn.Write(chunk); err != nil {
 			c.connWriteMu.Unlock()
 			return err
 		}
@@ -186,7 +218,8 @@ func (c *Connection) writeChunks(chunks ...[]byte) error {
 
 func (c *Connection) readChunk(chunk []byte) error {
 	c.connReadMu.Lock()
-	_, err := io.ReadAtLeast(c.conn, chunk, len(chunk)) // ToDo: timeout
+	c.conn.SetReadDeadline(time.Now().Add(c.readTimeout))
+	_, err := io.ReadAtLeast(c.conn, chunk, len(chunk))
 	c.connReadMu.Unlock()
 	return err
 }
@@ -232,8 +265,15 @@ func (c *Connection) reader() {
 	for c.connState != ConnectionStateClosed {
 		frame, err := c.recvFrame()
 		if err != nil {
-			os.Stderr.WriteString(`h2client.Connection.recvFrame error: `)
-			errors.Fprint(os.Stderr, err)
+			if netErr, ok := errors.Cause(err).(net.Error); ok {
+				if netErr.Timeout() || netErr.Temporary() {
+					continue
+				}
+			}
+
+			c.Logger.Write([]byte(fmt.Sprintf(`CONNECTION#%p h2client.Connection.recvFrame error: `, c)))
+			errors.Fprint(c.Logger, err)
+			c.Logger.Write([]byte("\n"))
 
 			if causeErr := errors.Cause(err); causeErr == io.EOF || causeErr == io.ErrUnexpectedEOF {
 				c.Close()
@@ -245,8 +285,7 @@ func (c *Connection) reader() {
 
 		frameHdr := frame.Hdr()
 
-		if frameHdr.StreamId == 0 {
-			// служебный фрейм
+		if frameHdr.StreamId == 0 { // служебный фрейм
 			switch frameHdr.Type {
 			case FrameTypeSettings:
 				c.settings.UpdateFromSettingsFrame(frame.(*SettingsFrame))
@@ -255,7 +294,7 @@ func (c *Connection) reader() {
 				if frame.Hdr().Flags&FlagAck == 0 {
 					// не нужно отсылать ACK на пришедший ACK :)
 					if err := c.sendFrame(FrameTypeSettings, FlagAck, 0, nil); err != nil {
-						os.Stderr.WriteString(`Cannot send answer to SETTINGS frame`)
+						c.Logger.Write([]byte("Cannot send answer to SETTINGS frame\n"))
 						c.Close()
 						return
 					}
@@ -267,7 +306,8 @@ func (c *Connection) reader() {
 
 			case FrameTypeWindowUpdate:
 				windowUpdateFrame := frame.(*WindowUpdateFrame)
-				atomic.AddInt64(&c.flowControlWindow, int64(windowUpdateFrame.WindowSizeIncrement))
+				cnt := atomic.AddInt64(&c.flowControlWindow, int64(windowUpdateFrame.WindowSizeIncrement))
+				fmt.Printf("CONNECTION#%p flowControlWindow +%d (%d) now:%d\n", c, windowUpdateFrame.WindowSizeIncrement, cnt, time.Now().Unix())
 
 			case FrameTypeGoaway:
 				goawayFrame := frame.(*GoawayFrame)
@@ -327,7 +367,7 @@ func (c *Connection) reader() {
 			rstStreamFrame := frame.(*RstStreamFrame)
 
 			c.streamsActiveMu.Lock()
-			fmt.Println(`RST_STREAM`, rstStreamFrame.ErrorCode, len(c.streamsActive)) // debug output
+			c.Logger.Write([]byte(fmt.Sprintln(`RST_STREAM`, rstStreamFrame.ErrorCode, len(c.streamsActive))))
 			delete(c.streamsActive, frameHdr.StreamId)
 			c.streamsActiveMu.Unlock()
 
@@ -335,6 +375,7 @@ func (c *Connection) reader() {
 
 		case FrameTypeWindowUpdate:
 			windowUpdateFrame := frame.(*WindowUpdateFrame)
+			fmt.Println(`STREAM#`, stream.id, ` flowControlWindow +`, windowUpdateFrame.WindowSizeIncrement)
 			atomic.AddInt64(&stream.flowControlWindow, int64(windowUpdateFrame.WindowSizeIncrement))
 
 		default:
@@ -419,16 +460,29 @@ func (c *Connection) reqWithLockedStream(req *request) (*response, error) {
 	}
 
 	// recv response
-	for respItem := range stream.respWait {
-		if respItem.streamId == streamIdx {
-			// это ответ на наш запрос, все хорошо
-			if !respItem.succ {
-				stream.resp.Canceled = true
+
+	req.timer.Reset(req.Timeout)
+forLabel:
+	for {
+		select {
+		case respItem := <-stream.respWait:
+			if respItem.streamId == streamIdx {
+				// это ответ на наш запрос, все хорошо
+				if !respItem.succ {
+					stream.resp.Canceled = true
+				}
+				break forLabel
 			}
-			break
+			// к нам долетел ответ на стрим, который раньше вовремя не ответил
+			// повторяем ожидание
+			continue forLabel
+
+		case <-req.timer.C:
+			// время вышло
+			stream.resp.Canceled = true
 		}
-		// к нам долетел ответ на стрим, который раньше вовремя не ответил
-		// повторяем ожидание
+
+		break
 	}
 
 	return &stream.resp, nil
@@ -442,18 +496,25 @@ func (c *Connection) sendRequestBody(req *request, stream *connectionStream) err
 			wantSend = bodyRest
 		}
 
+		waitTill := time.Now().Add(req.Timeout)
 		for {
 			connFcw := atomic.LoadInt64(&c.flowControlWindow)
 			streamFcw := atomic.LoadInt64(&stream.flowControlWindow)
 
+			if waitTill.Before(nowCached) {
+				// таймаут ожидания
+				fmt.Printf("conn:%p stream#%d WAIT_TIMEOUT wantSend:%d connFcw:%d streamFcw:%d now:%d\n", c, stream.id, wantSend, connFcw, streamFcw, nowCached.Unix())
+				return errors.Wrap(ErrNoFlowControlCapacity, `Flow-control timeout`)
+			}
+
 			if (wantSend <= connFcw) && (wantSend <= streamFcw) {
-				// Тут возможна ситуация гонок на flowControlWindow, но по RFC мы можем немного уходить в "минус"
+				// ToDo: тут возможна ситуация гонок на flowControlWindow
 				atomic.AddInt64(&c.flowControlWindow, -wantSend)
 				atomic.AddInt64(&stream.flowControlWindow, -wantSend)
 				break
 			}
 
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(20 * time.Millisecond)
 		}
 
 		flags := FrameFlags(0)

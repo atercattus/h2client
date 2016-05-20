@@ -16,6 +16,7 @@ const (
 	ErrWrongFramePayloadLength = ErrProtocol(`Wrong frame payload length`)
 	ErrHPACKDecodeFail         = ErrProtocol(`Cannot decode HPACK headers`)
 	ErrConnectionAlreadyClosed = ErrProtocol(`Connection already closed`)
+	ErrNoFlowControlCapacity   = ErrProtocol(`Flow-control window is not enought for frame sending`)
 
 	ErrPoolCapacityLimit = ErrCommon(`Pool capacity limit`)
 	ErrGoAwayRecieved    = ErrCommon(`GOAWAY frame received on connection`)

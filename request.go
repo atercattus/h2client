@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/tls"
 	"github.com/pkg/errors"
+	"math"
 	"net"
 	"net/url"
 	"strconv"
@@ -33,13 +34,31 @@ type (
 		tlsConfMu sync.RWMutex
 
 		cacheKey string
+
+		timer *time.Timer
 	}
 )
 
+const (
+	neverReached = time.Duration(math.MaxInt64)
+)
+
+var (
+	poolRequests sync.Pool
+)
+
+func init() {
+	poolRequests.New = func() interface{} {
+		req := request{}
+		req.timer = time.NewTimer(neverReached)
+		return &req
+	}
+}
+
 func NewRequest() *request {
-	req := request{}
+	req := poolRequests.Get().(*request)
 	req.Reset()
-	return &req
+	return req
 }
 
 func (r *request) ParseUrl(url_ string) error {
@@ -72,10 +91,16 @@ func (r *request) Reset() {
 	r.Port = 443
 	r.Path = ``
 
+	r.timer.Reset(neverReached)
+
 	r.DialTimeout = 1 * time.Second
 	r.Timeout = 1 * time.Second
 
 	r.SetTLSConfig(nil)
+}
+
+func (r *request) Close() {
+	poolRequests.Put(r)
 }
 
 func (r *request) SetTLSConfig(config *TLSConfig) {
