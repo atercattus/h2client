@@ -157,6 +157,10 @@ func NewConnection(req *request) (*Connection, error) {
 }
 
 func (c *Connection) LockStream() bool {
+	if c.IsClosed() {
+		return false
+	}
+
 	c.goawayFramesMu.RLock()
 	emptyGoAways := len(c.goawayFrames) == 0
 	c.goawayFramesMu.RUnlock()
@@ -182,10 +186,9 @@ func (c *Connection) UnlockStream() bool {
 	if cnt := atomic.AddInt32(&c.streamsReserved, -1); cnt >= 0 {
 		return true
 	}
-	cnt := atomic.AddInt32(&c.streamsReserved, 1)
-	if cnt == 0 {
-		c.Logger.Write([]byte("Conn EMPTY\n")) // ToDo: закрывать соединение?
-	}
+	// не парный вызов?
+
+	atomic.AddInt32(&c.streamsReserved, 1)
 	return false
 }
 
@@ -201,6 +204,10 @@ func (c *Connection) HasGoAwayFrames() (has bool) {
 	has = len(c.goawayFrames) > 0
 	c.goawayFramesMu.RUnlock()
 	return
+}
+
+func (c *Connection) IsClosed() bool {
+	return c.connState == ConnectionStateClosed
 }
 
 func (c *Connection) writeChunks(chunks ...[]byte) error {
@@ -251,7 +258,7 @@ func (c *Connection) beginHandshake() error {
 }
 
 func (c *Connection) Close() error {
-	if c.connState == ConnectionStateClosed {
+	if c.IsClosed() {
 		return errors.Wrap(ErrConnectionAlreadyClosed, `Cannot close already closed connection`)
 	}
 	c.connState = ConnectionStateClosed
@@ -262,7 +269,7 @@ func (c *Connection) Close() error {
 }
 
 func (c *Connection) reader() {
-	for c.connState != ConnectionStateClosed {
+	for !c.IsClosed() {
 		frame, err := c.recvFrame()
 		if err != nil {
 			if netErr, ok := errors.Cause(err).(net.Error); ok {
@@ -276,6 +283,7 @@ func (c *Connection) reader() {
 			c.Logger.Write([]byte("\n"))
 
 			if causeErr := errors.Cause(err); causeErr == io.EOF || causeErr == io.ErrUnexpectedEOF {
+				fmt.Println(`recvFrame error:` + err.Error())
 				c.Close()
 				return
 			}
@@ -295,6 +303,7 @@ func (c *Connection) reader() {
 					// не нужно отсылать ACK на пришедший ACK :)
 					if err := c.sendFrame(FrameTypeSettings, FlagAck, 0, nil); err != nil {
 						c.Logger.Write([]byte("Cannot send answer to SETTINGS frame\n"))
+						fmt.Println(`Cannot send answer to SETTINGS frame`)
 						c.Close()
 						return
 					}
@@ -306,8 +315,7 @@ func (c *Connection) reader() {
 
 			case FrameTypeWindowUpdate:
 				windowUpdateFrame := frame.(*WindowUpdateFrame)
-				cnt := atomic.AddInt64(&c.flowControlWindow, int64(windowUpdateFrame.WindowSizeIncrement))
-				fmt.Printf("CONNECTION#%p flowControlWindow +%d (%d) now:%d\n", c, windowUpdateFrame.WindowSizeIncrement, cnt, time.Now().Unix())
+				atomic.AddInt64(&c.flowControlWindow, int64(windowUpdateFrame.WindowSizeIncrement))
 
 			case FrameTypeGoaway:
 				goawayFrame := frame.(*GoawayFrame)
@@ -375,7 +383,6 @@ func (c *Connection) reader() {
 
 		case FrameTypeWindowUpdate:
 			windowUpdateFrame := frame.(*WindowUpdateFrame)
-			fmt.Println(`STREAM#`, stream.id, ` flowControlWindow +`, windowUpdateFrame.WindowSizeIncrement)
 			atomic.AddInt64(&stream.flowControlWindow, int64(windowUpdateFrame.WindowSizeIncrement))
 
 		default:
@@ -411,7 +418,7 @@ func (c *Connection) Req(req *request) (*response, error) {
 }
 
 func (c *Connection) reqWithLockedStream(req *request) (*response, error) {
-	if c.connState == ConnectionStateClosed {
+	if c.IsClosed() {
 		return nil, errors.Wrap(ErrConnectionAlreadyClosed, `Cannot work over closed connection`)
 	}
 
@@ -498,23 +505,23 @@ func (c *Connection) sendRequestBody(req *request, stream *connectionStream) err
 
 		waitTill := time.Now().Add(req.Timeout)
 		for {
-			connFcw := atomic.LoadInt64(&c.flowControlWindow)
-			streamFcw := atomic.LoadInt64(&stream.flowControlWindow)
-
 			if waitTill.Before(nowCached) {
 				// таймаут ожидания
-				fmt.Printf("conn:%p stream#%d WAIT_TIMEOUT wantSend:%d connFcw:%d streamFcw:%d now:%d\n", c, stream.id, wantSend, connFcw, streamFcw, nowCached.Unix())
+				//fmt.Printf("conn:%p stream#%d WAIT_TIMEOUT wantSend:%d connFcw:%d streamFcw:%d now:%d\n", c, stream.id, wantSend, connFcw, streamFcw, nowCached.Unix())
+				//fmt.Printf("conn:%p stream#%d WAIT_TIMEOUT wantSend:%d now:%d\n", c, stream.id, wantSend, nowCached.Unix())
 				return errors.Wrap(ErrNoFlowControlCapacity, `Flow-control timeout`)
 			}
 
-			if (wantSend <= connFcw) && (wantSend <= streamFcw) {
-				// ToDo: тут возможна ситуация гонок на flowControlWindow
-				atomic.AddInt64(&c.flowControlWindow, -wantSend)
-				atomic.AddInt64(&stream.flowControlWindow, -wantSend)
-				break
+			connFcw := atomic.AddInt64(&c.flowControlWindow, -wantSend)
+			streamFcw := atomic.AddInt64(&stream.flowControlWindow, -wantSend)
+			if connFcw < 0 || streamFcw < 0 {
+				atomic.AddInt64(&c.flowControlWindow, wantSend)
+				atomic.AddInt64(&stream.flowControlWindow, wantSend)
+				time.Sleep(20 * time.Millisecond)
+				continue
 			}
 
-			time.Sleep(20 * time.Millisecond)
+			break
 		}
 
 		flags := FrameFlags(0)
@@ -566,7 +573,6 @@ func (c *Connection) sendFrame(type_ FrameType, flags FrameFlags, streamId uint3
 		return errors.Wrap(err, `Build frame failed`)
 	}
 
-	//fmt.Println(`send`, FrameHdr{uint32(len(payload)), type_, flags, streamId}, string(payload))
 	err := c.writeChunks(buf.Bytes())
 
 	c.pollBytesBuffer.Put(buf)
