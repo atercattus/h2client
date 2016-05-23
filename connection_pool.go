@@ -3,6 +3,7 @@ package h2client
 import (
 	"github.com/pkg/errors"
 	"sync"
+	"time"
 )
 
 type (
@@ -31,19 +32,35 @@ func NewConnectionPool(maxConnsPerHost int) *ConnectionPool {
 }
 
 func (p *ConnectionPool) Do(req *request) (*response, error) {
-	conn, err := p.getConn(req)
-	if err != nil {
-		return nil, errors.Wrap(err, `There are no available connections`)
+	return p.do(req, nil)
+}
+
+func (p *ConnectionPool) do(req *request, failedConns []*Connection) (*response, error) {
+	for try := 1; try < 10; try++ {
+		conn, err := p.getConn(req, failedConns)
+		if err != nil {
+			return nil, errors.Wrap(err, `There are no available connections`)
+		}
+
+		resp, err := conn.reqWithLockedStream(req)
+		if err != nil {
+			if errors.Cause(err) == ErrNoFlowControlCapacity {
+				if len(failedConns) <= 5 {
+					failedConns = append(failedConns, conn)
+					continue
+				} else {
+					err = errors.Wrap(err, `Failed request execution because of flow-control`)
+				}
+			} else {
+				err = errors.Wrap(err, `Failed request execution`)
+			}
+		}
+
+		p.retConn(req, conn)
+
+		return resp, err
 	}
-
-	resp, err := conn.reqWithLockedStream(req)
-	if err != nil {
-		err = errors.Wrap(err, `Failed request execution`)
-	}
-
-	p.retConn(req, conn)
-
-	return resp, err
+	return nil, errors.Wrap(ErrPoolCapacityLimit, `There are no available working connections`)
 }
 
 // hostPool должен быть под write-lock
@@ -55,16 +72,18 @@ func (p *ConnectionPool) removeClosedConnections(hostPool *connectionPoolItem) {
 				hostPool.conns[i] = hostPool.conns[cnt-1]
 			}
 			cnt--
-			hostPool.conns = hostPool.conns[0 : cnt]
+			hostPool.conns = hostPool.conns[0:cnt]
 		}
 	}
 }
 
-func (p *ConnectionPool) selectConnInLockedPool(hostPool *connectionPoolItem) *Connection {
+func (p *ConnectionPool) selectConnInLockedPool(hostPool *connectionPoolItem, failedConns []*Connection) *Connection {
 selectConnLoop:
 	for retry := 1; retry < 100; retry++ { // 100 это очень много, беру с большим запасом
 		for _, conn := range hostPool.conns {
-			if conn.LockStream() {
+			if p.isConnInList(conn, failedConns) {
+				continue
+			} else if conn.LockStream() {
 				return conn
 			} else if conn.IsClosed() || conn.HasGoAwayFrames() {
 				p.removeClosedConnections(hostPool)
@@ -76,7 +95,16 @@ selectConnLoop:
 	return nil
 }
 
-func (p *ConnectionPool) getConn(req *request) (conn *Connection, err error) {
+func (p *ConnectionPool) isConnInList(conn *Connection, lst []*Connection) bool {
+	for _, c := range lst {
+		if c == conn {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *ConnectionPool) getConn(req *request, failedConns []*Connection) (conn *Connection, err error) {
 	poolKey := req.getCacheKey()
 
 	p.poolMu.RLock()
@@ -94,12 +122,25 @@ func (p *ConnectionPool) getConn(req *request) (conn *Connection, err error) {
 	}
 
 	hostPool.RLock()
-	for _, conn := range hostPool.conns {
-		if conn.LockStream() {
-			hostPool.RUnlock()
-			return conn, nil
+
+	if connsLen := int64(len(hostPool.conns)); connsLen > 0 {
+		fromIdx := time.Now().UnixNano() % connsLen
+		curIdx := fromIdx
+		for {
+			conn := hostPool.conns[curIdx]
+			if p.isConnInList(conn, failedConns) {
+				// do nothing
+			} else if conn.LockStream() {
+				hostPool.RUnlock()
+				return conn, nil
+			}
+
+			if curIdx = (curIdx + 1) % connsLen; curIdx == fromIdx {
+				break
+			}
 		}
 	}
+
 	hostPool.RUnlock()
 
 	// Все имеющиеся в пуле соединения нагружены по полной.
@@ -107,7 +148,7 @@ func (p *ConnectionPool) getConn(req *request) (conn *Connection, err error) {
 
 	hostPool.Lock()
 
-	if conn := p.selectConnInLockedPool(hostPool); conn != nil {
+	if conn := p.selectConnInLockedPool(hostPool, failedConns); conn != nil {
 		// таки нашли подходящий коннект
 		hostPool.Unlock()
 		return conn, nil
