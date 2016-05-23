@@ -69,7 +69,7 @@ type (
 
 	PingFrame struct { // http://http2.github.io/http2-spec/#PING
 		FrameHdr
-		Data uint64
+		Data [8]byte
 	}
 
 	GoawayFrame struct { // http://http2.github.io/http2-spec/#GOAWAY

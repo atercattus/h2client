@@ -164,20 +164,20 @@ func (c *Connection) LockStream() bool {
 	c.goawayFramesMu.RLock()
 	emptyGoAways := len(c.goawayFrames) == 0
 	c.goawayFramesMu.RUnlock()
-
 	if !emptyGoAways {
 		// после получения GOAWAY создавать новые стримы на данном соединении уже нельзя
 		return false
 	}
 
 	if fcw := atomic.LoadInt64(&c.flowControlWindow); fcw < 512 {
-		// окна почти нет, лучше взять другое соединение. НУЖНО ТЕСТИТЬ ТАКОЙ ЗАПРЕТ!
+		// окна почти нет, лучше взять другое соединение
 		return false
 	}
 
 	if cnt := atomic.AddInt32(&c.streamsReserved, 1); int64(cnt) <= int64(c.settings.MaxConcurrentStreams) {
 		return true
 	}
+	// достигнут лимит числа стримов в соединении
 	atomic.AddInt32(&c.streamsReserved, -1)
 	return false
 }
@@ -322,6 +322,12 @@ func (c *Connection) reader() {
 				c.goawayFramesMu.Lock()
 				c.goawayFrames = append(c.goawayFrames, goawayFrame)
 				c.goawayFramesMu.Unlock()
+
+			case FrameTypePing:
+				pingFrame := frame.(*PingFrame)
+				if (pingFrame.Flags & FlagAck) == 0 {
+					c.sendFrame(FrameTypePing, FlagAck, 0, pingFrame.Data[:])
+				}
 
 			default:
 				// игнорируем незнакомые типы фреймов
@@ -722,6 +728,15 @@ func (c *Connection) recvFrame() (frame Frame, err error) {
 		frameWindowUpdate := WindowUpdateFrame{FrameHdr: frameHdr}
 		frameWindowUpdate.WindowSizeIncrement = endianess.Uint32(payload[0:4])
 		return &frameWindowUpdate, nil
+
+	case FrameTypePing:
+		if frameHdr.Length != 8 {
+			return frame, errors.Wrap(ErrWrongFramePayloadLength, `Wrong frame`)
+		}
+
+		framePing := PingFrame{}
+		copy(framePing.Data[:], payload[0:8])
+		return &framePing, nil
 
 	default:
 		err = NewErrProtocol(`Unsupported frame type ` + frameHdr.Type.String())
