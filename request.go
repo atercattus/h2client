@@ -27,8 +27,8 @@ type (
 		Port int
 		Path string
 
-		DialTimeout time.Duration // ToDo: поддержать
-		Timeout     time.Duration // ToDo: поддержать
+		DialTimeout time.Duration
+		Timeout     time.Duration
 
 		tlsConf   *TLSConfig
 		tlsConfMu sync.RWMutex
