@@ -1,7 +1,6 @@
 package h2client
 
 import (
-	"fmt"
 	"github.com/pkg/errors"
 	"sync"
 )
