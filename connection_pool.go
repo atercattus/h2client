@@ -54,7 +54,8 @@ func (p *ConnectionPool) removeClosedConnections(hostPool *connectionPoolItem) {
 			if i < cnt-1 {
 				hostPool.conns[i] = hostPool.conns[cnt-1]
 			}
-			hostPool.conns = hostPool.conns[0 : cnt-1]
+			cnt--
+			hostPool.conns = hostPool.conns[0 : cnt]
 		}
 	}
 }
