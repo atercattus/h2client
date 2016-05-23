@@ -289,15 +289,15 @@ func (c *Connection) reader() {
 				}
 			}
 
-			c.Logger.Write([]byte(fmt.Sprintf(`CONNECTION#%p h2client.Connection.recvFrame error: `, c)))
-			errors.Fprint(c.Logger, err)
-			c.Logger.Write([]byte("\n"))
-
 			if causeErr := errors.Cause(err); causeErr == io.EOF || causeErr == io.ErrUnexpectedEOF {
 				fmt.Println(`recvFrame error:` + err.Error())
 				c.Close()
 				return
 			}
+
+			c.Logger.Write([]byte(fmt.Sprintf(`CONNECTION#%p h2client.Connection.recvFrame error: `, c)))
+			errors.Fprint(c.Logger, err)
+			c.Logger.Write([]byte("\n"))
 
 			continue // или выйти?
 		}
