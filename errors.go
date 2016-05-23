@@ -21,6 +21,7 @@ const (
 	ErrPoolCapacityLimit = ErrCommon(`Pool capacity limit`)
 	ErrGoAwayRecieved    = ErrCommon(`GOAWAY frame received on connection`)
 	ErrBug               = ErrCommon(`Bug`)
+	ErrTimeout           = ErrCommon(`Timeout`)
 )
 
 func NewErrProtocol(s string) error {

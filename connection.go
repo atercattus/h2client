@@ -100,8 +100,18 @@ func NewConnection(req *request) (*Connection, error) {
 	}
 
 	conn := tls.Client(tcpConn, &tlsConf)
-	if err := conn.Handshake(); err != nil {
-		return nil, errors.Wrap(err, `TLS handshake fail`)
+
+	errChan := make(chan error, 2)
+	timer := time.AfterFunc(req.DialTimeout, func() {
+		errChan <- ErrTimeout
+	})
+	go func() {
+		err := conn.Handshake()
+		timer.Stop()
+		errChan <- errors.Wrap(err, `TLS handshake fail`)
+	}()
+	if err := <-errChan; err != nil {
+		return nil, errors.Wrap(err, `TLS handshare fail or timeouted`)
 	}
 
 	settings := GetDefaultSettings()
