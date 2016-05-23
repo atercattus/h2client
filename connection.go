@@ -111,6 +111,7 @@ func NewConnection(req *request) (*Connection, error) {
 		errChan <- errors.Wrap(err, `TLS handshake fail`)
 	}()
 	if err := <-errChan; err != nil {
+		tcpConn.Close()
 		return nil, errors.Wrap(err, `TLS handshare fail or timeouted`)
 	}
 
