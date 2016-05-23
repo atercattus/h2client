@@ -1,6 +1,7 @@
 package h2client
 
 import (
+	"fmt"
 	"github.com/pkg/errors"
 	"sync"
 )
@@ -46,6 +47,35 @@ func (p *ConnectionPool) Do(req *request) (*response, error) {
 	return resp, err
 }
 
+// hostPool должен быть под write-lock
+func (p *ConnectionPool) removeClosedConnections(hostPool *connectionPoolItem) {
+	cnt := len(hostPool.conns)
+	for i := 0; i < cnt; i++ {
+		if conn := hostPool.conns[i]; conn.IsClosed() {
+			if i < cnt-1 {
+				hostPool.conns[i] = hostPool.conns[cnt-1]
+			}
+			hostPool.conns = hostPool.conns[0 : cnt-1]
+		}
+	}
+}
+
+func (p *ConnectionPool) selectConnInLockedPool(hostPool *connectionPoolItem) *Connection {
+selectConnLoop:
+	for retry := 1; retry < 100; retry++ { // 100 это очень много, беру с большим запасом
+		for _, conn := range hostPool.conns {
+			if conn.LockStream() {
+				return conn
+			} else if conn.IsClosed() || conn.HasGoAwayFrames() {
+				p.removeClosedConnections(hostPool)
+				continue selectConnLoop
+			}
+		}
+		break
+	}
+	return nil
+}
+
 func (p *ConnectionPool) getConn(req *request) (conn *Connection, err error) {
 	poolKey := req.getCacheKey()
 
@@ -68,24 +98,19 @@ func (p *ConnectionPool) getConn(req *request) (conn *Connection, err error) {
 		if conn.LockStream() {
 			hostPool.RUnlock()
 			return conn, nil
-		} else if conn.HasGoAwayFrames() {
-			// соединение должно быть закрыто, когда все стримы в нем отработают
 		}
 	}
 	hostPool.RUnlock()
 
 	// Все имеющиеся в пуле соединения нагружены по полной.
-	// Нужно выделить еще один коннект (еси не превысили лимит).
+	// Нужно выделить еще один коннект (если не превысили лимит).
 
 	hostPool.Lock()
 
-	for _, conn := range hostPool.conns {
-		if conn.LockStream() {
-			hostPool.Unlock()
-			return conn, nil
-		} else if conn.HasGoAwayFrames() {
-			// соединение должно быть закрыто, когда все стримы в нем отработают
-		}
+	if conn := p.selectConnInLockedPool(hostPool); conn != nil {
+		// таки нашли подходящий коннект
+		hostPool.Unlock()
+		return conn, nil
 	}
 
 	if len(hostPool.conns) >= p.maxConnsPerHost {
