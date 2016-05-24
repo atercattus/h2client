@@ -160,6 +160,7 @@ func NewConnection(req *request) (*Connection, error) {
 	h2c.hpackDecoder = hpack.NewDecoder(settings.HeaderTableSize, nil)
 
 	if err := h2c.beginHandshake(); err != nil {
+		conn.Close()
 		return nil, errors.Wrap(err, `Handshake fail`)
 	}
 
