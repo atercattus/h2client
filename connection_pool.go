@@ -67,7 +67,7 @@ func (p *ConnectionPool) do(req *request, failedConns []*Connection) (*response,
 func (p *ConnectionPool) removeClosedConnections(hostPool *connectionPoolItem) {
 	cnt := len(hostPool.conns)
 	for i := 0; i < cnt; i++ {
-		if conn := hostPool.conns[i]; conn.IsClosed() {
+		if conn := hostPool.conns[i]; conn.IsClosed() || conn.HasGoAwayFrames() {
 			if i < cnt-1 {
 				hostPool.conns[i] = hostPool.conns[cnt-1]
 			}
