@@ -452,11 +452,11 @@ func (c *Connection) Req(req *request) (*response, error) {
 }
 
 func (c *Connection) reqWithLockedStream(req *request) (*response, error) {
-	if c.IsClosed() {
-		return nil, errors.Wrap(ErrConnectionAlreadyClosed, `Cannot work over closed connection`)
-	}
-
 	for c.connState != ConnectionStateOpened { // ToDo: сделать лучше
+		if c.IsClosed() {
+			return nil, errors.Wrap(ErrConnectionAlreadyClosed, `Cannot work over closed connection`)
+		}
+
 		time.Sleep(10 * time.Millisecond)
 	}
 
