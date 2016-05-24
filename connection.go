@@ -8,6 +8,7 @@ import (
 	"github.com/pkg/errors"
 	"golang.org/x/net/http2/hpack"
 	"io"
+	"math"
 	"net"
 	"os"
 	"strconv"
@@ -280,6 +281,8 @@ func (c *Connection) Close() error {
 }
 
 func (c *Connection) reader() {
+	timer := time.NewTimer(math.MaxInt64)
+
 	for !c.IsClosed() {
 		frame, err := c.recvFrame()
 		if err != nil {
@@ -398,6 +401,8 @@ func (c *Connection) reader() {
 
 			stream.respWait <- respWaitItem{streamId: stream.id, succ: false}
 
+			continue // или break?
+
 		case FrameTypeWindowUpdate:
 			windowUpdateFrame := frame.(*WindowUpdateFrame)
 			atomic.AddInt64(&stream.flowControlWindow, int64(windowUpdateFrame.WindowSizeIncrement))
@@ -411,7 +416,18 @@ func (c *Connection) reader() {
 			delete(c.streamsActive, frameHdr.StreamId)
 			c.streamsActiveMu.Unlock()
 
-			stream.respWait <- respWaitItem{streamId: stream.id, succ: true}
+			timer.Reset(1 * time.Second)
+			select {
+			case <-timer.C:
+			default:
+			}
+
+			select {
+			case stream.respWait <- respWaitItem{streamId: stream.id, succ: true}:
+				// all ok
+			case <-timer.C:
+				// wtf ?
+			}
 		}
 	}
 }
