@@ -9,6 +9,7 @@ import (
 	"golang.org/x/net/http2/hpack"
 	"io"
 	"math"
+	"math/rand"
 	"net"
 	"os"
 	"strconv"
@@ -21,6 +22,8 @@ import (
 type (
 	Connection struct {
 		Logger io.Writer
+
+		connLocker chan struct{}
 
 		host string
 		port int
@@ -46,7 +49,8 @@ type (
 		hpackEncoder       *hpack.Encoder
 		hpackEncoderBuffer bytes.Buffer
 
-		flowControlWindow int64 // это лимит удаленной стороны, который мы уменьшаем, когда МЫ отсылаем DATA фреймы, а не когда их присылают нам
+		flowControlWindow          int64 // это лимит удаленной стороны, который мы уменьшаем, когда МЫ отсылаем DATA фреймы, а не когда их присылают нам
+		flowControlWindowEmptyFrom int64 // с какого времени нам не достаточно буфера
 
 		streamsActive   map[uint32]*connectionStream
 		streamsReserved int32 // сколько стримов используются в соединении. может быть больше len(streamsActive), но всегда не больше settings.MaxConcurrentStreams
@@ -118,7 +122,8 @@ func NewConnection(req *request) (*Connection, error) {
 
 	settings := GetDefaultSettings()
 	h2c := Connection{
-		Logger: os.Stderr, // ioutil.Discard,
+		Logger:     os.Stderr, // ioutil.Discard,
+		connLocker: make(chan struct{}),
 
 		host:              req.Host,
 		port:              req.Port,
@@ -169,25 +174,32 @@ func NewConnection(req *request) (*Connection, error) {
 	return &h2c, nil
 }
 
+func (c *Connection) GetConnLocker() chan struct{} {
+	return c.connLocker
+}
+
+func (c *Connection) IsConnected() bool {
+	return c.connState == ConnectionStateOpened
+}
+
 func (c *Connection) LockStream() bool {
-	if c.IsClosed() {
+	if c.connState != ConnectionStateOpened {
 		return false
 	}
 
-	c.goawayFramesMu.RLock()
-	emptyGoAways := len(c.goawayFrames) == 0
-	c.goawayFramesMu.RUnlock()
-	if !emptyGoAways {
+	if c.HasGoAwayFrames() {
 		// после получения GOAWAY создавать новые стримы на данном соединении уже нельзя
 		return false
 	}
 
 	if fcw := atomic.LoadInt64(&c.flowControlWindow); fcw < 512 {
 		// окна почти нет, лучше взять другое соединение
+		c.markFlowControlInsufficient()
 		return false
 	}
 
-	if cnt := atomic.AddInt32(&c.streamsReserved, 1); int64(cnt) <= int64(c.settings.MaxConcurrentStreams) {
+	settingsMaxCnt := int64(c.settings.MaxConcurrentStreams)
+	if cnt := atomic.AddInt32(&c.streamsReserved, 1); int64(cnt) <= settingsMaxCnt {
 		return true
 	}
 	// достигнут лимит числа стримов в соединении
@@ -223,6 +235,10 @@ func (c *Connection) IsClosed() bool {
 	return c.connState == ConnectionStateClosed
 }
 
+func (c *Connection) IsConsideredClosed() bool {
+	return c.connState == ConnectionStateClosed || c.connState == ConnectionStateWantClose
+}
+
 func (c *Connection) writeChunks(chunks ...[]byte) error {
 	c.connWriteMu.Lock()
 	c.conn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
@@ -238,10 +254,20 @@ func (c *Connection) writeChunks(chunks ...[]byte) error {
 
 func (c *Connection) readChunk(chunk []byte) error {
 	c.connReadMu.Lock()
-	c.conn.SetReadDeadline(time.Now().Add(c.readTimeout))
-	_, err := io.ReadAtLeast(c.conn, chunk, len(chunk))
+
+	readed, needed := 0, len(chunk)
+	for readed < needed {
+		c.conn.SetReadDeadline(time.Now().Add(c.readTimeout))
+		if n, err := c.conn.Read(chunk[readed:]); err != nil {
+			c.connReadMu.Unlock()
+			return err
+		} else {
+			readed += n
+		}
+	}
+
 	c.connReadMu.Unlock()
-	return err
+	return nil
 }
 
 func (c *Connection) beginHandshake() error {
@@ -281,21 +307,30 @@ func (c *Connection) Close() error {
 	return c.conn.Close()
 }
 
+func (c *Connection) WantClose() {
+	if !c.IsConsideredClosed() {
+		c.connState = ConnectionStateWantClose
+	}
+}
+
 func (c *Connection) reader() {
+	defer c.Close()
+
 	timer := time.NewTimer(math.MaxInt64)
 
-	for !c.IsClosed() {
+	for !c.IsConsideredClosed() {
 		frame, err := c.recvFrame()
 		if err != nil {
-			if netErr, ok := errors.Cause(err).(net.Error); ok {
+			cause := errors.Cause(err)
+			if netErr, ok := cause.(net.Error); ok {
 				if netErr.Timeout() || netErr.Temporary() {
 					continue
 				}
+			} else if cause == ErrTimeout {
+				continue
 			}
 
 			if causeErr := errors.Cause(err); causeErr == io.EOF || causeErr == io.ErrUnexpectedEOF {
-				fmt.Println(`recvFrame error:` + err.Error())
-				c.Close()
 				return
 			}
 
@@ -318,19 +353,19 @@ func (c *Connection) reader() {
 					// не нужно отсылать ACK на пришедший ACK :)
 					if err := c.sendFrame(FrameTypeSettings, FlagAck, 0, nil); err != nil {
 						c.Logger.Write([]byte("Cannot send answer to SETTINGS frame\n"))
-						fmt.Println(`Cannot send answer to SETTINGS frame`)
-						c.Close()
 						return
 					}
 				}
 
 				if c.connState == ConnectionStateWaitPrefaceSettings {
 					c.connState = ConnectionStateOpened
+					close(c.connLocker)
 				}
 
 			case FrameTypeWindowUpdate:
 				windowUpdateFrame := frame.(*WindowUpdateFrame)
 				atomic.AddInt64(&c.flowControlWindow, int64(windowUpdateFrame.WindowSizeIncrement))
+				c.markFlowControlSufficient()
 
 			case FrameTypeGoaway:
 				goawayFrame := frame.(*GoawayFrame)
@@ -453,7 +488,7 @@ func (c *Connection) Req(req *request) (*response, error) {
 
 func (c *Connection) reqWithLockedStream(req *request) (*response, error) {
 	for c.connState != ConnectionStateOpened { // ToDo: сделать лучше
-		if c.IsClosed() {
+		if c.IsConsideredClosed() {
 			return nil, errors.Wrap(ErrConnectionAlreadyClosed, `Cannot work over closed connection`)
 		}
 
@@ -490,12 +525,14 @@ func (c *Connection) reqWithLockedStream(req *request) (*response, error) {
 	if err != nil {
 		c.doMu.Unlock()
 		c.pollStream.Put(stream)
+		c.WantClose()
 		return nil, errors.Wrap(err, `Send header frame fail`)
 	}
 	c.doMu.Unlock()
 
 	if withBody {
 		if err := c.sendRequestBody(req, stream); err != nil {
+			c.WantClose()
 			return nil, errors.Wrap(err, `Cannot send request body payload`)
 		}
 	}
@@ -541,8 +578,7 @@ func (c *Connection) sendRequestBody(req *request, stream *connectionStream) err
 		for {
 			if waitTill.Before(nowCached) {
 				// таймаут ожидания
-				//fmt.Printf("conn:%p stream#%d WAIT_TIMEOUT wantSend:%d connFcw:%d streamFcw:%d now:%d\n", c, stream.id, wantSend, connFcw, streamFcw, nowCached.Unix())
-				//fmt.Printf("conn:%p stream#%d WAIT_TIMEOUT wantSend:%d now:%d\n", c, stream.id, wantSend, nowCached.Unix())
+				c.markFlowControlInsufficient()
 				return errors.Wrap(ErrNoFlowControlCapacity, `Flow-control timeout`)
 			}
 
@@ -551,9 +587,11 @@ func (c *Connection) sendRequestBody(req *request, stream *connectionStream) err
 			if connFcw < 0 || streamFcw < 0 {
 				atomic.AddInt64(&c.flowControlWindow, wantSend)
 				atomic.AddInt64(&stream.flowControlWindow, wantSend)
-				time.Sleep(20 * time.Millisecond)
+				time.Sleep(time.Duration(rand.Int31n(50)+10) * time.Millisecond)
 				continue
 			}
+
+			c.markFlowControlSufficient()
 
 			break
 		}
@@ -772,4 +810,14 @@ func (c *Connection) recvFrame() (frame Frame, err error) {
 	}
 
 	return
+}
+
+func (c *Connection) markFlowControlInsufficient() {
+	// сохраняю первое срабатывание нехватки буфера, чтобы все последующие не сдвигали его
+	atomic.CompareAndSwapInt64(&c.flowControlWindowEmptyFrom, 0, nowCached.Unix())
+}
+
+func (c *Connection) markFlowControlSufficient() {
+	// хватило буферов для отправки - сбрасываю "время недостаточности окна"
+	atomic.StoreInt64(&c.flowControlWindowEmptyFrom, 0)
 }

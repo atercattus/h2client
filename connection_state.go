@@ -11,6 +11,7 @@ const (
 	ConnectionStateWaitPrefaceSettings
 	ConnectionStateOpened
 	ConnectionStateClosed
+	ConnectionStateWantClose
 )
 
 func (c ConnectionState) String() string {
@@ -23,6 +24,8 @@ func (c ConnectionState) String() string {
 		return `ConnectionState(Opened)`
 	case ConnectionStateClosed:
 		return `ConnectionState(Closed)`
+	case ConnectionStateWantClose:
+		return `ConnectionState(WantClose)`
 	default:
 		return fmt.Sprintf(`ConnectionState(%d)`, c)
 	}
