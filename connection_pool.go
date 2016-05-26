@@ -69,7 +69,7 @@ func (p *ConnectionPool) closedConnRemover() {
 }
 
 func (p *ConnectionPool) do(req *request, failedConns []*Connection) (*response, error) {
-	for try := 1; try < 10; try++ {
+	for try := 1; try < 5; try++ {
 		conn, err := p.getConn(req, failedConns)
 		if err != nil {
 			return nil, errors.Wrap(err, `There are no available connections`)
@@ -89,11 +89,13 @@ func (p *ConnectionPool) do(req *request, failedConns []*Connection) (*response,
 	return nil, errors.Wrap(ErrPoolCapacityLimit, `There are no available working connections`)
 }
 
-func (p *ConnectionPool) selectConnInPool(hostPool *connectionPoolItem, failedConns []*Connection) *Connection {
+func (p *ConnectionPool) selectConnInPool(hostPool *connectionPoolItem, failedConns []*Connection) (*Connection, int) {
 	connsLen := int64(len(hostPool.conns))
 	if connsLen == 0 {
-		return nil
+		return nil, 0
 	}
+
+	workingCnt := 0
 
 	fromIdx := time.Now().UnixNano() % connsLen
 	curIdx := fromIdx
@@ -105,13 +107,17 @@ func (p *ConnectionPool) selectConnInPool(hostPool *connectionPoolItem, failedCo
 		} else if p.isConnInList(conn, failedConns) {
 			// соединение, с которым у нас уже не получилось выполнить запрос
 			// do nothing
-		} else if conn.LockStream() {
-			return conn
 		} else {
-			fcwef := atomic.LoadInt64(&conn.flowControlWindowEmptyFrom)
-			if diff := nowCached.Unix() - fcwef; fcwef > 0 && diff >= 20 { // ToDo: вынести в конфиг
-				conn.WantClose()
-				failedConns = append(failedConns, conn)
+			workingCnt++
+
+			if conn.LockStream() {
+				return conn, workingCnt
+			} else {
+				fcwef := atomic.LoadInt64(&conn.flowControlWindowEmptyFrom)
+				if diff := nowCached.Unix() - fcwef; fcwef > 0 && diff >= 20 { // ToDo: вынести в конфиг
+					conn.WantClose()
+					failedConns = append(failedConns, conn)
+				}
 			}
 		}
 
@@ -120,7 +126,7 @@ func (p *ConnectionPool) selectConnInPool(hostPool *connectionPoolItem, failedCo
 		}
 	}
 
-	return nil
+	return nil, workingCnt
 }
 
 func (p *ConnectionPool) isConnInList(conn *Connection, lst []*Connection) bool {
@@ -133,7 +139,7 @@ func (p *ConnectionPool) isConnInList(conn *Connection, lst []*Connection) bool 
 }
 
 func (p *ConnectionPool) getConn(req *request, failedConns []*Connection) (conn *Connection, err error) {
-	for try := 1; try <= 10; try++ {
+	for try := 1; try <= 5; try++ {
 		conn, err = p.getConnInternal(req, failedConns)
 		if conn != nil {
 			return conn, nil
@@ -162,7 +168,7 @@ func (p *ConnectionPool) getConnInternal(req *request, failedConns []*Connection
 	}
 
 	hostPool.RLock()
-	conn = p.selectConnInPool(hostPool, failedConns)
+	conn, _ = p.selectConnInPool(hostPool, failedConns)
 	hostPool.RUnlock()
 	if conn != nil {
 		return conn, nil
@@ -173,14 +179,15 @@ func (p *ConnectionPool) getConnInternal(req *request, failedConns []*Connection
 
 	hostPool.Lock()
 
-	if conn := p.selectConnInPool(hostPool, failedConns); conn != nil {
+	var workingCnt int
+	conn, workingCnt = p.selectConnInPool(hostPool, failedConns)
+	if conn != nil {
 		// таки нашли подходящий коннект
 		hostPool.Unlock()
 		return conn, nil
 	}
 
-	// ToDo: считать количество рабочих соединений без учета закрытых
-	if len(hostPool.conns) >= p.maxConnsPerHost {
+	if workingCnt >= p.maxConnsPerHost {
 		hostPool.Unlock()
 		return nil, errors.Wrap(ErrPoolCapacityLimit, `Limit check`)
 	}

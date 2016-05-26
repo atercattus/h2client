@@ -232,6 +232,32 @@ func (c *Connection) IsConsideredClosed() bool {
 	return c.connState == ConnectionStateClosed || c.connState == ConnectionStateWantClose
 }
 
+func (c *Connection) Close() error {
+	if c.IsClosed() {
+		return errors.Wrap(ErrConnectionAlreadyClosed, `Cannot close already closed connection`)
+	}
+	c.connState = ConnectionStateClosed
+
+	c.streamsActiveMu.Lock()
+	for _, stream := range c.streamsActive {
+		select {
+		case stream.respWait <- respWaitItem{streamId: stream.id, succ: false}:
+		default:
+		}
+	}
+	c.streamsActiveMu.Unlock()
+
+	c.hpackDecoder.Close()
+
+	return c.conn.Close()
+}
+
+func (c *Connection) WantClose() {
+	if !c.IsConsideredClosed() {
+		c.connState = ConnectionStateWantClose
+	}
+}
+
 func (c *Connection) writeChunks(chunks ...[]byte) error {
 	c.connWriteMu.Lock()
 	c.conn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
@@ -289,41 +315,29 @@ func (c *Connection) beginHandshake() error {
 	return nil
 }
 
-func (c *Connection) Close() error {
-	if c.IsClosed() {
-		return errors.Wrap(ErrConnectionAlreadyClosed, `Cannot close already closed connection`)
-	}
-	c.connState = ConnectionStateClosed
-
-	c.hpackDecoder.Close()
-
-	return c.conn.Close()
-}
-
-func (c *Connection) WantClose() {
-	if !c.IsConsideredClosed() {
-		c.connState = ConnectionStateWantClose
-	}
-}
-
 func (c *Connection) reader() {
 	defer c.Close()
 
 	timer := time.NewTimer(math.MaxInt64)
 
-	for !c.IsConsideredClosed() {
+	lastRecvAt := nowCached.Unix()
+
+	for !c.IsClosed() {
 		frame, err := c.recvFrame()
 		if err != nil {
-			cause := errors.Cause(err)
-			if netErr, ok := cause.(net.Error); ok {
+			if diff := nowCached.Unix() - lastRecvAt; diff > 15 {
+				c.Logger.Write([]byte(fmt.Sprintf("Connection#%p lastRecvFrame timeout\n", c)))
+				return
+			}
+
+			causeErr := errors.Cause(err)
+			if netErr, ok := causeErr.(net.Error); ok {
 				if netErr.Timeout() || netErr.Temporary() {
 					continue
 				}
-			} else if cause == ErrTimeout {
+			} else if causeErr == ErrTimeout {
 				continue
-			}
-
-			if causeErr := errors.Cause(err); causeErr == io.EOF || causeErr == io.ErrUnexpectedEOF {
+			} else if causeErr == io.EOF || causeErr == io.ErrUnexpectedEOF {
 				return
 			}
 
@@ -333,6 +347,8 @@ func (c *Connection) reader() {
 
 			continue // или выйти?
 		}
+
+		lastRecvAt = nowCached.Unix()
 
 		frameHdr := frame.Hdr()
 
@@ -483,7 +499,6 @@ func (c *Connection) reqWithLockedStream(req *request) (*response, error) {
 		if c.IsConsideredClosed() {
 			return nil, errors.Wrap(ErrConnectionAlreadyClosed, `Cannot work over closed connection`)
 		}
-
 		time.Sleep(10 * time.Millisecond)
 	}
 
