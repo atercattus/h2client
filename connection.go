@@ -23,8 +23,6 @@ type (
 	Connection struct {
 		Logger io.Writer
 
-		connLocker chan struct{}
-
 		host string
 		port int
 
@@ -122,8 +120,7 @@ func NewConnection(req *request) (*Connection, error) {
 
 	settings := GetDefaultSettings()
 	h2c := Connection{
-		Logger:     os.Stderr, // ioutil.Discard,
-		connLocker: make(chan struct{}),
+		Logger: os.Stderr, // ioutil.Discard,
 
 		host:              req.Host,
 		port:              req.Port,
@@ -172,10 +169,6 @@ func NewConnection(req *request) (*Connection, error) {
 	go h2c.reader()
 
 	return &h2c, nil
-}
-
-func (c *Connection) GetConnLocker() chan struct{} {
-	return c.connLocker
 }
 
 func (c *Connection) IsConnected() bool {
@@ -359,7 +352,6 @@ func (c *Connection) reader() {
 
 				if c.connState == ConnectionStateWaitPrefaceSettings {
 					c.connState = ConnectionStateOpened
-					close(c.connLocker)
 				}
 
 			case FrameTypeWindowUpdate:

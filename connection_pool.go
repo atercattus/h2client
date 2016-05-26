@@ -109,7 +109,7 @@ func (p *ConnectionPool) selectConnInPool(hostPool *connectionPoolItem, failedCo
 			return conn
 		} else {
 			fcwef := atomic.LoadInt64(&conn.flowControlWindowEmptyFrom)
-			if diff := nowCached.Unix() - fcwef; fcwef > 0 && diff >= 10 { // ToDo: 10 сек вынести в конфиг
+			if diff := nowCached.Unix() - fcwef; fcwef > 0 && diff >= 20 { // ToDo: вынести в конфиг
 				conn.WantClose()
 				failedConns = append(failedConns, conn)
 			}
@@ -193,8 +193,6 @@ func (p *ConnectionPool) getConnInternal(req *request, failedConns []*Connection
 	hostPool.conns = append(hostPool.conns, conn)
 
 	hostPool.Unlock()
-
-	<-conn.GetConnLocker() // ждем завершения http/2 хендшейка. стоит ли?
 
 	return nil, nil
 }
