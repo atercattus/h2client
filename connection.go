@@ -326,7 +326,7 @@ func (c *Connection) reader() {
 		frame, err := c.recvFrame()
 		if err != nil {
 			if diff := nowCached.Unix() - lastRecvAt; diff > 15 {
-				c.Logger.Write([]byte(fmt.Sprintf("Connection#%p lastRecvFrame timeout\n", c)))
+				//c.Logger.Write([]byte(fmt.Sprintf("Connection#%p lastRecvFrame timeout\n", c)))
 				return
 			}
 
